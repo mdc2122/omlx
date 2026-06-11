@@ -894,6 +894,7 @@ class TestProcessChatMessages:
             text_msgs,
             [],
             audio=None,
+            videos=None,
             chat_template_kwargs=None,
             tools=None,
         )
@@ -1013,6 +1014,66 @@ class TestProcessChatMessages:
 
         call_kwargs = engine._prepare_vision_inputs.call_args[1]
         assert call_kwargs["tools"] is None
+
+    @patch("omlx.engine.vlm.extract_media_from_messages")
+    def test_process_chat_messages_passes_videos_to_prepare(self, mock_extract):
+        """Video references are forwarded to _prepare_vision_inputs()."""
+        text_msgs = [{"role": "user", "content": "Describe"}]
+        mock_extract.return_value = (text_msgs, [], [], ["/tmp/a.mp4"])
+
+        engine = _make_loaded_engine()
+        engine._prepare_vision_inputs = MagicMock(
+            return_value=([1, 2, 3], None, None, None, 0, [])
+        )
+
+        messages = [{"role": "user", "content": "Describe"}]
+        engine._process_chat_messages(messages, tools=None, kwargs={})
+
+        engine._prepare_vision_inputs.assert_called_once_with(
+            text_msgs,
+            [],
+            audio=None,
+            videos=["/tmp/a.mp4"],
+            chat_template_kwargs=None,
+            tools=None,
+        )
+
+    def test_text_only_and_image_only_paths_unchanged(self):
+        """Text-only and image-only paths still pass videos=None to prepare."""
+        engine = _make_loaded_engine()
+        engine._prepare_vision_inputs = MagicMock(
+            return_value=([1, 2, 3], None, None, None, 0, [])
+        )
+
+        with patch(
+            "omlx.engine.vlm.extract_media_from_messages",
+            return_value=([{"role": "user", "content": "Hi"}], [], [], []),
+        ):
+            result = engine._process_chat_messages(
+                [{"role": "user", "content": "Hi"}],
+                tools=None,
+                kwargs={},
+            )
+
+        assert result == ([1, 2, 3], None, None, None, 0, [])
+        assert engine._prepare_vision_inputs.call_args[1]["videos"] is None
+
+        from PIL import Image
+
+        mock_image = Image.new("RGB", (4, 4), "red")
+        text_msgs = [{"role": "user", "content": "Describe"}]
+        engine._apply_ocr_prompt = MagicMock(return_value=text_msgs)
+        with patch(
+            "omlx.engine.vlm.extract_media_from_messages",
+            return_value=(text_msgs, [mock_image], [], []),
+        ):
+            engine._process_chat_messages(
+                [{"role": "user", "content": "Describe"}],
+                tools=None,
+                kwargs={},
+            )
+
+        assert engine._prepare_vision_inputs.call_args[1]["videos"] is None
 
 
 # ---------------------------------------------------------------------------
@@ -1725,6 +1786,162 @@ class TestSplitVisionFeatures:
         features = mx.ones((100, 128))  # 2D, non-Qwen
         result = engine._split_vision_features(features, 3, {})
         assert result is None
+
+
+# ---------------------------------------------------------------------------
+# TestVideoVLMPath
+# ---------------------------------------------------------------------------
+
+
+class TestVideoVLMPath:
+    """Tests for video_url decoding and mlx-vlm video input plumbing."""
+
+    def test_format_messages_for_vlm_template_adds_video_message(self, monkeypatch):
+        """Video-bearing user turns emit mlx-vlm video placeholders."""
+        captured = {}
+
+        def fake_get_message_json(model_type, content, role, **kwargs):
+            captured.update(kwargs)
+            return {
+                "role": role,
+                "content": [
+                    {
+                        "type": "video",
+                        "video": kwargs.get("video"),
+                        "fps": 1,
+                    },
+                    {"type": "text", "text": content},
+                ],
+            }
+
+        monkeypatch.setattr(
+            "mlx_vlm.prompt_utils.get_message_json",
+            fake_get_message_json,
+        )
+
+        engine = _make_loaded_engine(model_type="qwen3_5_moe")
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "video_url",
+                        "video_url": {"url": "/tmp/a.mp4"},
+                    },
+                    {"type": "text", "text": "Describe"},
+                ],
+            },
+        ]
+
+        formatted, image_ranges = engine._format_messages_for_vlm_template(
+            messages,
+            num_images=0,
+            num_audios=0,
+            num_videos=1,
+            videos=["/tmp/a.mp4"],
+        )
+
+        assert captured.get("video") == "/tmp/a.mp4"
+        assert captured.get("num_images") == 0
+        assert captured.get("num_audios") == 0
+        assert image_ranges == []
+        assert formatted[0]["content"][0]["type"] == "video"
+
+    @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+    @patch("mlx_vlm.utils.prepare_inputs")
+    def test_prepare_vision_inputs_passes_videos_to_prepare_inputs(self, mock_prepare):
+        """prepare_inputs receives videos= and video_grid_thw survives embedding kwargs."""
+        engine = _make_loaded_engine(model_type="qwen3_5_moe")
+        mock_processor = MagicMock()
+        mock_processor.apply_chat_template.return_value = "<prompt>"
+        mock_processor.tokenizer = engine._tokenizer
+        engine._processor = mock_processor
+
+        grid = mx.array([[2, 4, 4]])
+        mock_prepare.return_value = {
+            "input_ids": mx.array([[1, 2, 3]]),
+            "attention_mask": mx.array([[1, 1, 1]]),
+            "pixel_values_videos": mx.zeros((1, 3, 8, 8)),
+            "video_grid_thw": grid,
+        }
+
+        embed_features = MagicMock()
+        embed_features.inputs_embeds = mx.zeros((1, 3, 16))
+        embed_features.to_dict.return_value = {}
+        engine._vlm_model.get_input_embeddings = MagicMock(return_value=embed_features)
+
+        messages = [{"role": "user", "content": "Describe"}]
+        token_ids, embeds, vlm_kwargs, image_hash, cache_start, cache_ranges = (
+            engine._prepare_vision_inputs(
+                messages,
+                [],
+                videos=["/tmp/a.mp4"],
+            )
+        )
+
+        assert mock_prepare.call_args[1]["videos"] == ["/tmp/a.mp4"]
+        assert token_ids == [1, 2, 3]
+        assert embeds is not None
+        assert image_hash is None
+        assert cache_start == 0
+        assert cache_ranges == []
+        engine._vlm_model.get_input_embeddings.assert_called_once()
+        call_kwargs = engine._vlm_model.get_input_embeddings.call_args[1]
+        assert call_kwargs["video_grid_thw"] is grid
+
+    @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+    def test_video_grid_thw_uses_qwen_vision_tower(self):
+        """video_grid_thw routes through the qwen vision tower when no image grid."""
+        engine = _make_loaded_engine(model_type="qwen3_5_moe")
+        mock_tower = MagicMock(return_value=mx.ones((4, 128)))
+        mock_weight = SimpleNamespace(dtype=mx.float32)
+        mock_tower.patch_embed.proj.weight = mock_weight
+        engine._vlm_model = SimpleNamespace(
+            config=engine._vlm_model.config,
+            vision_tower=mock_tower,
+        )
+
+        grid = mx.array([[1, 4, 4]])
+        pixel_values = mx.zeros((1, 3, 8, 8))
+
+        engine._compute_vision_features(
+            pixel_values,
+            {"video_grid_thw": grid},
+        )
+
+        mock_tower.assert_called_once()
+        assert mock_tower.call_args[0][1] is grid
+
+    @pytest.mark.asyncio
+    async def test_preflight_counts_video_parts(self):
+        """preflight_chat adds a conservative video token budget."""
+        from omlx.engine.vlm import _VIDEO_TOKEN_UPPER_BOUND_FALLBACK
+
+        engine = _make_loaded_engine(model_type="qwen3_5_moe")
+        engine._tokenizer = MockVLMTokenizer()
+        engine._tokenizer.encode = MagicMock(return_value=list(range(42)))
+
+        mock_scheduler = MagicMock()
+        engine._engine.engine = MagicMock()
+        engine._engine.engine.scheduler = mock_scheduler
+
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "video_url",
+                        "video_url": {"url": "https://example.com/a.mp4"},
+                    },
+                    {"type": "text", "text": "Describe"},
+                ],
+            },
+        ]
+
+        await engine.preflight_chat(messages)
+
+        seen = mock_scheduler.preflight_or_raise.call_args[1]
+        assert seen["num_prompt_tokens"] == 42 + _VIDEO_TOKEN_UPPER_BOUND_FALLBACK
 
 
 # ---------------------------------------------------------------------------
