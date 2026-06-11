@@ -221,7 +221,7 @@ class TorchFreeQwen3VLVideoProcessor:
         return flatten[0], [grid_t, grid_h, grid_w], metadata
 
     def __call__(self, videos: Any, **kwargs: Any) -> BatchFeature:
-        return_metadata = kwargs.pop("return_metadata", True)
+        return_metadata = kwargs.pop("return_metadata", False)
         fps = kwargs.pop("fps", None)
         if not isinstance(videos, list):
             videos = [videos]

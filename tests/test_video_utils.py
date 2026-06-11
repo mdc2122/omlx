@@ -142,6 +142,27 @@ def test_output_dtype_float32():
     assert out["pixel_values_videos"].dtype == np.float32
 
 
+def test_default_call_output_is_mlx_convertible():
+    import mlx.core as mx
+
+    processor = _make_processor()
+    video = _make_video(4, 64, 64)
+    out = processor([video])
+
+    assert set(out.keys()) == {"pixel_values_videos", "video_grid_thw"}
+    for value in out.values():
+        mx.array(value)
+
+
+def test_return_metadata_opt_in():
+    processor = _make_processor()
+    video = _make_video(4, 64, 64)
+    out = processor([video], fps=3.5, return_metadata=True)
+
+    assert "video_metadata" in out
+    assert out["video_metadata"][0].fps == 3.5
+
+
 def test_shim_attributes_from_image_processor():
     image_processor = SimpleNamespace(
         patch_size=16,
