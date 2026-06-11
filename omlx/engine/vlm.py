@@ -231,6 +231,34 @@ def _patch_video_processor_bug():
     _video_processor_patched = True
 
 
+def _attach_torch_free_video_processor(processor) -> None:
+    """Attach a numpy/PIL video processor shim for Qwen3-VL when missing."""
+    if processor is None:
+        return
+
+    cls_name = processor.__class__.__name__
+    existing_vp = getattr(processor, "video_processor", None)
+    if existing_vp is not None:
+        return
+
+    is_qwen3_vl = cls_name == "Qwen3VLProcessor"
+    has_video_token = getattr(processor, "video_token", None) is not None
+    if not is_qwen3_vl and not has_video_token:
+        return
+
+    image_processor = getattr(processor, "image_processor", None)
+    if image_processor is None:
+        return
+
+    try:
+        from ..utils.video import TorchFreeQwen3VLVideoProcessor
+
+        processor.video_processor = TorchFreeQwen3VLVideoProcessor(image_processor)
+        logger.debug("Attached torch-free Qwen3-VL video processor shim")
+    except Exception as exc:
+        logger.warning("Failed to attach torch-free video processor shim: %s", exc)
+
+
 _torch_free_ip_patched = False
 
 
@@ -994,6 +1022,7 @@ class VLMBatchedEngine(BaseEngine):
         )
 
         _fix_processor_none_pixels(self._processor)
+        _attach_torch_free_video_processor(self._processor)
         self._diffusion_family = self._detect_diffusion_family()
         if self.is_diffusion_model:
             logger.info(

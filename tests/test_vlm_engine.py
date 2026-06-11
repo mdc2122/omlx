@@ -1992,3 +1992,73 @@ class TestStopSafety:
         await engine.stop()
 
         mock_inner_engine.close.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# Torch-free video processor shim attach
+# ---------------------------------------------------------------------------
+
+
+class TestTorchFreeVideoProcessorAttach:
+    """Tests for _attach_torch_free_video_processor at processor load."""
+
+    def test_attaches_when_video_token_and_no_video_processor(self):
+        from omlx.engine.vlm import _attach_torch_free_video_processor
+
+        ip = SimpleNamespace(
+            patch_size=16,
+            temporal_patch_size=2,
+            merge_size=2,
+            do_rescale=True,
+            rescale_factor=1 / 255.0,
+            do_normalize=True,
+            image_mean=[0.5, 0.5, 0.5],
+            image_std=[0.5, 0.5, 0.5],
+            do_convert_rgb=True,
+        )
+
+        class FakeProcessor:
+            video_token = "<|video_pad|>"
+            image_processor = ip
+
+        processor = FakeProcessor()
+        _attach_torch_free_video_processor(processor)
+
+        from omlx.utils.video import TorchFreeQwen3VLVideoProcessor
+
+        assert isinstance(processor.video_processor, TorchFreeQwen3VLVideoProcessor)
+
+    def test_leaves_existing_video_processor_untouched(self):
+        from omlx.engine.vlm import _attach_torch_free_video_processor
+
+        existing = object()
+
+        class Qwen3VLProcessor:
+            video_token = "<|video_pad|>"
+            video_processor = existing
+            image_processor = SimpleNamespace(patch_size=16)
+
+        processor = Qwen3VLProcessor()
+        _attach_torch_free_video_processor(processor)
+
+        assert processor.video_processor is existing
+
+    def test_degrades_when_shim_construction_raises(self, caplog):
+        from omlx.engine.vlm import _attach_torch_free_video_processor
+
+        class Qwen3VLProcessor:
+            video_token = "<|video_pad|>"
+            image_processor = SimpleNamespace(patch_size=16)
+
+        processor = Qwen3VLProcessor()
+        assert not hasattr(processor, "video_processor")
+
+        with patch(
+            "omlx.utils.video.TorchFreeQwen3VLVideoProcessor",
+            side_effect=RuntimeError("shim failed"),
+        ):
+            with caplog.at_level("WARNING"):
+                _attach_torch_free_video_processor(processor)
+
+        assert "Failed to attach torch-free video processor shim" in caplog.text
+        assert not hasattr(processor, "video_processor")
