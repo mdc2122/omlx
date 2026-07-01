@@ -79,6 +79,19 @@ def _update_indexer_cache_only(indexer: Any, x: Any, cache: Any) -> None:
         cache.update_and_fetch(k, mx.zeros([b, 1, s, 0]))
 
 
+def _update_shared_indexer_cache_placeholder(attn: Any, x: Any, cache: Any) -> None:
+    """Advance a shared indexer cache when the layer has no indexer module."""
+    if cache is None:
+        return
+    b, s, _ = x.shape
+    head_dim = getattr(getattr(attn, "config", None), "index_head_dim", None)
+    if not head_dim:
+        head_dim = getattr(attn, "qk_rope_head_dim", 0)
+    k = mx.zeros([b, 1, s, head_dim], dtype=x.dtype)
+    v = mx.zeros([b, 1, s, 0], dtype=x.dtype)
+    cache.update_and_fetch(k, v)
+
+
 def _make_patched_attention_call(original_call):
     """Create a patched __call__ for DeepseekV32Attention.
 
@@ -126,16 +139,24 @@ def _make_patched_attention_call(original_call):
             cache = [None] * 2
 
         # --- IndexCache: conditionally skip indexer ---
+        indexer = getattr(self, "indexer", None)
+        state = getattr(self, "_ic_state", None)
+        if state is None:
+            model_ref = getattr(self, "_ic_model_ref", None)
+            state = getattr(model_ref, "_index_cache_state", None)
+
         if self._ic_is_full:
-            topk_indices = self.indexer(x, qr, mask, cache=cache[1])
-            self._ic_model_ref._index_cache_state[
-                "last_topk_indices"
-            ] = topk_indices
+            topk_indices = indexer(x, qr, mask, cache=cache[1]) if indexer else None
+            if state is not None:
+                state["last_topk_indices"] = topk_indices
         else:
-            _update_indexer_cache_only(self.indexer, x, cache[1])
-            topk_indices = self._ic_model_ref._index_cache_state[
-                "last_topk_indices"
-            ]
+            if indexer is not None:
+                _update_indexer_cache_only(indexer, x, cache[1])
+            else:
+                _update_shared_indexer_cache_placeholder(self, x, cache[1])
+            topk_indices = (
+                state.get("last_topk_indices") if state is not None else None
+            )
         # --- end IndexCache ---
 
         if topk_indices is not None:
@@ -166,7 +187,12 @@ def _make_patched_attention_call(original_call):
                 mask = sparse_mask
 
         # Ensure the indexer cache is evaluated even if unused
-        if cache is not None and cache[0] is not None:
+        if (
+            cache is not None
+            and cache[0] is not None
+            and cache[1] is not None
+            and getattr(cache[1], "keys", None) is not None
+        ):
             cache[0].keys = mx.depends(
                 cache[0].keys, (cache[1].keys, cache[1].values)
             )
@@ -196,6 +222,37 @@ def _make_patched_attention_call(original_call):
         return self.o_proj(output)
 
     return patched_call
+
+
+def apply_index_cache_call_patch() -> bool:
+    """Install the DeepSeek/GLM DSA attention call wrapper once."""
+    global _class_patch_applied
+
+    if _class_patch_applied:
+        return False
+
+    from mlx_lm.models.deepseek_v32 import (
+        DeepseekV32Attention,
+        DeepseekV32Model,
+    )
+
+    original_attn_call = DeepseekV32Attention.__call__
+    DeepseekV32Attention.__call__ = _make_patched_attention_call(
+        original_attn_call
+    )
+
+    original_model_call = DeepseekV32Model.__call__
+
+    def _patched_model_call(self, x, cache=None):
+        if hasattr(self, "_index_cache_state"):
+            self._index_cache_state["last_topk_indices"] = None
+        return original_model_call(self, x, cache=cache)
+
+    DeepseekV32Model.__call__ = _patched_model_call
+
+    _class_patch_applied = True
+    logger.info("IndexCache: class-level patches applied")
+    return True
 
 
 def apply_index_cache(model: Any, index_cache_freq: int) -> bool:
@@ -241,6 +298,7 @@ def apply_index_cache(model: Any, index_cache_freq: int) -> bool:
 
     # Attach shared state to the inner model
     inner_model._index_cache_state = {"last_topk_indices": None}
+    state = inner_model._index_cache_state
 
     # Set per-layer flags on each attention module
     for i, layer in enumerate(layers):
@@ -248,32 +306,9 @@ def apply_index_cache(model: Any, index_cache_freq: int) -> bool:
             continue
         attn = layer.self_attn
         attn._ic_is_full = pattern[i]
-        attn._ic_model_ref = inner_model
+        attn._ic_state = state
 
     # Apply class-level monkey-patch (only once)
-    if not _class_patch_applied:
-        from mlx_lm.models.deepseek_v32 import (
-            DeepseekV32Attention,
-            DeepseekV32Model,
-        )
-
-        # Patch Attention.__call__
-        original_attn_call = DeepseekV32Attention.__call__
-        DeepseekV32Attention.__call__ = _make_patched_attention_call(
-            original_attn_call
-        )
-
-        # Patch Model.__call__ to reset shared state each forward pass
-        original_model_call = DeepseekV32Model.__call__
-
-        def _patched_model_call(self, x, cache=None):
-            if hasattr(self, "_index_cache_state"):
-                self._index_cache_state["last_topk_indices"] = None
-            return original_model_call(self, x, cache=cache)
-
-        DeepseekV32Model.__call__ = _patched_model_call
-
-        _class_patch_applied = True
-        logger.info("IndexCache: class-level patches applied")
+    apply_index_cache_call_patch()
 
     return True

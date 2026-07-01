@@ -153,6 +153,14 @@ def maybe_apply_pre_load_patches(
         if apply_llama4_attention_patch():
             logger.info("Llama 4 attention patch applied for %s", model_name)
 
+    if model_type == "glm_moe_dsa":
+        from ..patches.glm_moe_dsa_shared_indexer import (
+            apply_glm_moe_dsa_shared_indexer_patch,
+        )
+
+        if apply_glm_moe_dsa_shared_indexer_patch():
+            logger.info("GLM DSA shared-indexer patch applied for %s", model_name)
+
     if for_vlm and model_type == "diffusion_gemma":
         from ..patches.mlx_vlm_diffusion import apply_mlx_vlm_diffusion_patch
 
