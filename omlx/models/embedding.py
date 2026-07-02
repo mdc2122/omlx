@@ -4,12 +4,14 @@ MLX Embedding Model wrapper.
 
 This module provides a wrapper around mlx-embeddings for generating
 text embeddings using Apple's MLX framework, with native fallback
-for XLMRoBERTa and BERT embedding models.
+for XLMRoBERTa, BERT, and Qwen2-decoder embedding models.
 """
 
+import gc
 import inspect
 import json
 import logging
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
@@ -17,6 +19,7 @@ from typing import Any, Dict, List, Optional, Union
 import mlx.core as mx
 from mlx.utils import tree_flatten
 
+from ..utils.compile_cache import clear_thread_compile_cache
 from .mlx_embeddings_compat import (
     patch_qwen3_vl_processor_for_torch_free_image_loading,
 )
@@ -32,6 +35,7 @@ _CONTEXT_LENGTH_ATTRS = (
     "seq_length",
     "n_positions",
 )
+_FALSE_ENV_VALUES = {"0", "false", "no", "off"}
 
 
 @dataclass
@@ -58,6 +62,8 @@ class MLXEmbeddingModel:
     Supports:
     - Native XLMRoBERTa embedding (no mlx-embeddings dependency)
     - Native BERT embedding (no mlx-embeddings dependency)
+    - Native Qwen2-decoder embedding (last-token + L2; jina-code, gte-Qwen2)
+      — mlx-embeddings has no qwen2 module
     - mlx-embeddings fallback for other architectures
 
     Example:
@@ -111,8 +117,14 @@ class MLXEmbeddingModel:
         architectures = config_dict.get("architectures", [])
         arch = architectures[0] if architectures else ""
 
-        native_arches = {"XLMRobertaModel", "BertModel", "BertForMaskedLM"}
-        if arch not in native_arches:
+        native_arch_modules = {
+            "XLMRobertaModel": "xlm_roberta",
+            "BertModel": "xlm_roberta",
+            "BertForMaskedLM": "xlm_roberta",
+            "Qwen2ForCausalLM": "qwen2_embedding",
+        }
+        module_name = native_arch_modules.get(arch)
+        if module_name is None:
             logger.debug(
                 f"Architecture '{arch}' not natively supported for embedding, "
                 "trying mlx-embeddings"
@@ -120,7 +132,11 @@ class MLXEmbeddingModel:
             return False
 
         try:
-            from .xlm_roberta import Model, ModelArgs
+            from importlib import import_module
+
+            native_module = import_module(f"{__package__}.{module_name}")
+            Model = native_module.Model
+            ModelArgs = native_module.ModelArgs
 
             known_fields = {f.name for f in ModelArgs.__dataclass_fields__.values()}
             model_config = {
@@ -464,6 +480,15 @@ class MLXEmbeddingModel:
           for some embedding/reranker models, causing eval() runtime errors.
         - We compile a narrower function that returns only the final embedding array.
         """
+        compile_env = os.getenv("OMLX_EMBEDDING_COMPILE", "1").strip().lower()
+        if compile_env in _FALSE_ENV_VALUES:
+            logger.info(
+                "mx.compile disabled for %s by OMLX_EMBEDDING_COMPILE",
+                self.model_name,
+            )
+            self._compiled_embed = None
+            return False
+
         base_model = self.model
 
         try:
@@ -485,6 +510,37 @@ class MLXEmbeddingModel:
             logger.info(f"mx.compile unavailable for {self.model_name}: {e}")
             self._compiled_embed = None
             return False
+
+    def close(self) -> None:
+        """Release model, processor, and compiled embedding resources."""
+        if not self._loaded and self.model is None and self.processor is None:
+            self._compiled_embed = None
+            self._is_compiled = False
+            return
+
+        logger.info(
+            "Releasing embedding model resources: %s "
+            "(compiled=%s, native=%s)",
+            self.model_name,
+            self._is_compiled,
+            self._using_native,
+        )
+
+        self._compiled_embed = None
+        self._is_compiled = False
+
+        self.model = None
+        self.processor = None
+        self._hidden_size = None
+        self._loaded = False
+        self._using_native = False
+        self._remap_input_ids_to_inputs = False
+
+        gc.collect()
+        mx.synchronize()
+        mx.clear_cache()
+        clear_thread_compile_cache()
+        gc.collect()
 
     def embed(
         self,

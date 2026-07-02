@@ -10,6 +10,7 @@ Tests cover:
 - Engine stop safety (close() exception guard)
 """
 
+import base64
 import io
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -142,6 +143,39 @@ class TestVLMStreamingCleanup:
 
         assert fake_engine.aborted_request_id == "vlm-request-1"
 
+    @pytest.mark.asyncio
+    @pytest.mark.skipif(
+        not HAS_MLX, reason="mlx is required to import VLMBatchedEngine"
+    )
+    async def test_stream_preserves_generation_timestamps(self):
+        """VLM benchmark timing needs producer-side token timestamps."""
+
+        class TimestampCore(FakeStreamingCore):
+            async def stream_outputs(self, request_id):
+                yield SimpleNamespace(
+                    output_text="done",
+                    new_text="done",
+                    prompt_tokens=8,
+                    completion_tokens=4,
+                    finished=True,
+                    finish_reason="length",
+                    tool_calls=None,
+                    cached_tokens=0,
+                    generated_at=10.0,
+                    generated_until=12.0,
+                )
+
+        engine = _make_loaded_engine(model_type="test-vlm")
+        engine._engine = TimestampCore()
+
+        outputs = []
+        async for output in engine.stream_generate("hello"):
+            outputs.append(output)
+
+        assert len(outputs) == 1
+        assert outputs[0].generated_at == 10.0
+        assert outputs[0].generated_until == 12.0
+
 
 class TestVLMDiffusionLane:
     """Tests for DiffusionGemma routing in VLMBatchedEngine."""
@@ -247,6 +281,7 @@ class TestVLMDiffusionLane:
         not HAS_MLX, reason="mlx is required to import VLMBatchedEngine"
     )
     async def test_diffusion_preflight_rejects_tools(self):
+        """Tools rejected when no tool parser matched the chat template."""
         from omlx.exceptions import InvalidRequestError
 
         engine = _make_loaded_engine(model_type="diffusion_gemma")
@@ -257,6 +292,41 @@ class TestVLMDiffusionLane:
                 [{"role": "user", "content": "hi"}],
                 tools=[{"type": "function", "function": {"name": "lookup"}}],
             )
+
+    @pytest.mark.asyncio
+    @pytest.mark.skipif(
+        not HAS_MLX, reason="mlx is required to import VLMBatchedEngine"
+    )
+    async def test_diffusion_preflight_allows_tools_with_parser(self):
+        """Tools accepted when the tokenizer has an injected tool parser."""
+        tokenizer = MockVLMTokenizer()
+        tokenizer.has_tool_calling = True
+        tokenizer.tool_call_start = "<|tool_call>"
+        tokenizer.tool_call_end = "<tool_call|>"
+        tokenizer.tool_parser = lambda text, tools=None: {
+            "name": "lookup",
+            "arguments": "{}",
+        }
+
+        engine = _make_loaded_engine(
+            model_type="diffusion_gemma", tokenizer=tokenizer
+        )
+        engine._diffusion_family = "block"
+
+        assert engine.supports_tool_calling is True
+        # Must not raise
+        await engine.preflight_chat(
+            [{"role": "user", "content": "hi"}],
+            tools=[{"type": "function", "function": {"name": "lookup"}}],
+        )
+
+    @pytest.mark.skipif(
+        not HAS_MLX, reason="mlx is required to import VLMBatchedEngine"
+    )
+    def test_diffusion_supports_tool_calling_false_without_parser(self):
+        engine = _make_loaded_engine(model_type="diffusion_gemma")
+        engine._diffusion_family = "block"
+        assert engine.supports_tool_calling is False
 
     @pytest.mark.skipif(
         not HAS_MLX, reason="mlx is required to import VLMBatchedEngine"
@@ -660,6 +730,60 @@ class TestApplyChatTemplate:
 
         call_kwargs = tokenizer.apply_chat_template.call_args[1]
         assert call_kwargs["enable_thinking"] is True
+
+    def test_minimax_m3_maps_enable_thinking_to_thinking_mode(self):
+        """MiniMax M3 templates use thinking_mode instead of enable_thinking."""
+        tokenizer = MagicMock()
+        tokenizer.apply_chat_template.return_value = "<prompt>"
+        engine = _make_loaded_engine(
+            model_type="minimax_m3_vl",
+            tokenizer=tokenizer,
+            enable_thinking=False,
+        )
+
+        messages = [{"role": "user", "content": "Hello"}]
+        engine._apply_chat_template(messages)
+
+        call_kwargs = tokenizer.apply_chat_template.call_args[1]
+        assert "enable_thinking" not in call_kwargs
+        assert call_kwargs["thinking_mode"] == "disabled"
+
+    def test_minimax_m3_preserves_explicit_thinking_mode(self):
+        tokenizer = MagicMock()
+        tokenizer.apply_chat_template.return_value = "<prompt>"
+        engine = _make_loaded_engine(
+            model_type="minimax_m3_vl",
+            tokenizer=tokenizer,
+            enable_thinking=False,
+        )
+
+        messages = [{"role": "user", "content": "Hello"}]
+        engine._apply_chat_template(
+            messages,
+            chat_template_kwargs={"thinking_mode": "adaptive"},
+        )
+
+        call_kwargs = tokenizer.apply_chat_template.call_args[1]
+        assert "enable_thinking" not in call_kwargs
+        assert call_kwargs["thinking_mode"] == "adaptive"
+
+    def test_minimax_m3_maps_request_enable_thinking_kwarg(self):
+        tokenizer = MagicMock()
+        tokenizer.apply_chat_template.return_value = "<prompt>"
+        engine = _make_loaded_engine(
+            model_type="minimax_m3_vl",
+            tokenizer=tokenizer,
+        )
+
+        messages = [{"role": "user", "content": "Hello"}]
+        engine._apply_chat_template(
+            messages,
+            chat_template_kwargs={"enable_thinking": True},
+        )
+
+        call_kwargs = tokenizer.apply_chat_template.call_args[1]
+        assert "enable_thinking" not in call_kwargs
+        assert call_kwargs["thinking_mode"] == "enabled"
 
     def test_fallback_when_no_template(self):
         """Tokenizer without apply_chat_template → manual concatenation."""
@@ -2062,3 +2186,187 @@ class TestTorchFreeVideoProcessorAttach:
 
         assert "Failed to attach torch-free video processor shim" in caplog.text
         assert not hasattr(processor, "video_processor")
+    @pytest.mark.asyncio
+    async def test_stop_drops_vlm_refs_and_cache_before_inner_close(self):
+        """VLM wrapper refs and feature cache are released before final reclaim."""
+        engine = _make_loaded_engine()
+        events = []
+        vision_cache = MagicMock()
+        vision_cache.close.side_effect = lambda: events.append("vision_cache")
+        engine._vision_cache = vision_cache
+        engine._engine.stop = AsyncMock(side_effect=lambda: events.append("stop"))
+        engine._grammar_compiler = object()
+        engine._grammar_compiler_init_attempted = True
+
+        mock_inner_engine = MagicMock()
+
+        def close_side_effect():
+            events.append("inner_close")
+            assert engine._engine is None
+            assert engine._vlm_model is None
+            assert engine._processor is None
+            assert engine._adapter is None
+            assert engine._tokenizer is None
+            assert engine._grammar_compiler is None
+            assert engine._grammar_compiler_init_attempted is False
+            assert engine._vision_cache is None
+
+        mock_inner_engine.close.side_effect = close_side_effect
+        engine._engine.engine = mock_inner_engine
+
+        await engine.stop()
+
+        assert events == ["stop", "vision_cache", "inner_close"]
+
+    @pytest.mark.asyncio
+    async def test_stop_sets_diffusion_cancel_before_dropping_model_refs(self):
+        """Diffusion workers see cancellation before model refs are cleared."""
+        engine = _make_loaded_engine(model_type="diffusion_gemma")
+        engine._diffusion_family = "block"
+        engine._engine = None
+        engine._processor = MagicMock()
+        events = []
+
+        class RecordingCancelEvent:
+            def set(self):
+                events.append(
+                    (
+                        "cancel",
+                        engine._vlm_model is not None,
+                        engine._processor is not None,
+                    )
+                )
+
+        engine._diffusion_cancel_events = {RecordingCancelEvent()}
+
+        await engine.stop()
+
+        assert events == [("cancel", True, True)]
+        assert engine._vlm_model is None
+        assert engine._processor is None
+
+
+# ---------------------------------------------------------------------------
+# TestPreflightImageTokenCount
+# ---------------------------------------------------------------------------
+
+
+# Qwen3.x-VL / Qwen2.5-VL image-processor defaults used across these tests.
+_QWEN_IP = SimpleNamespace(
+    patch_size=16, merge_size=2, min_pixels=65536, max_pixels=16777216
+)
+_QWEN_PROC = SimpleNamespace(image_processor=_QWEN_IP)
+
+
+def _png_data_uri(width: int, height: int) -> str:
+    """Build a ``data:`` base64 PNG of the given pixel size."""
+    from PIL import Image
+
+    buf = io.BytesIO()
+    Image.new("RGB", (width, height)).save(buf, format="PNG")
+    return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
+
+
+def _image_part(width: int, height: int) -> dict:
+    return {"type": "image_url", "image_url": {"url": _png_data_uri(width, height)}}
+
+
+class TestSmartResizeTokens:
+    """`_smart_resize_tokens` must match the Qwen processor's grid -> token math."""
+
+    @pytest.mark.parametrize(
+        "w,h,expected",
+        [
+            (512, 512, 256),     # exact multiple of patch*merge (32)
+            (336, 336, 100),     # 336 -> 336 grid 21x21 -> 441//4... rounds via factor
+            (510, 680, 336),     # non-multiple, rounded to nearest factor
+            (100, 100, 64),      # below min_pixels -> upscaled to min
+            (4000, 3000, 11750),  # above max_pixels -> downscaled to cap
+            (2791, 16, 106),     # thin image: branch on raw rounded dims
+        ],
+    )
+    def test_matches_known_grid(self, w, h, expected):
+        from omlx.engine.vlm import _smart_resize_tokens
+
+        got = _smart_resize_tokens(
+            h, w, _QWEN_IP.patch_size, _QWEN_IP.merge_size,
+            _QWEN_IP.min_pixels, _QWEN_IP.max_pixels,
+        )
+        assert got == expected
+
+    def test_zero_dims_return_zero(self):
+        from omlx.engine.vlm import _smart_resize_tokens
+
+        assert _smart_resize_tokens(0, 512, 16, 2, 65536, 16777216) == 0
+
+
+class TestReadImageDims:
+    """`_read_image_dims` reads dimensions decode-free, or returns None safely."""
+
+    def test_reads_data_uri(self):
+        from omlx.engine.vlm import _read_image_dims
+
+        assert _read_image_dims(_image_part(640, 480)) == (640, 480)
+
+    def test_http_url_returns_none(self):
+        from omlx.engine.vlm import _read_image_dims
+
+        part = {"type": "image_url",
+                "image_url": {"url": "https://example.com/x.jpg"}}
+        assert _read_image_dims(part) is None
+
+    def test_garbage_returns_none(self):
+        from omlx.engine.vlm import _read_image_dims
+
+        part = {"type": "image_url",
+                "image_url": {"url": "data:image/png;base64,not-base64!!"}}
+        assert _read_image_dims(part) is None
+
+
+class TestCountImageTokensReal:
+    """`_count_image_tokens_real` charges actual size, not the max_pixels ceiling."""
+
+    def test_counts_real_size_not_upper_bound(self):
+        from omlx.engine.vlm import _count_image_tokens_real
+
+        # 20 down-sized 512x512 frames (livestream client shape).
+        content = [_image_part(512, 512) for _ in range(20)]
+        content.append({"type": "text", "text": "describe"})
+        messages = [{"role": "user", "content": content}]
+
+        total = _count_image_tokens_real(messages, _QWEN_PROC, upper_bound=16384)
+        assert total == 20 * 256  # 5120, not 20 * 16384 = 327680
+
+    def test_counts_thin_image_without_undercounting(self):
+        from omlx.engine.vlm import _count_image_tokens_real
+
+        messages = [{"role": "user", "content": [_image_part(2791, 16)]}]
+
+        total = _count_image_tokens_real(messages, _QWEN_PROC, upper_bound=16384)
+        assert total == 106  # Qwen grid_thw=[1, 2, 212]
+
+    def test_falls_back_to_upper_bound_for_unreadable(self):
+        from omlx.engine.vlm import _count_image_tokens_real
+
+        messages = [{"role": "user", "content": [
+            {"type": "image_url",
+             "image_url": {"url": "https://example.com/x.jpg"}},
+            {"type": "text", "text": "hi"},
+        ]}]
+        total = _count_image_tokens_real(messages, _QWEN_PROC, upper_bound=16384)
+        assert total == 16384
+
+    def test_falls_back_when_processor_not_qwen_style(self):
+        from omlx.engine.vlm import _count_image_tokens_real
+
+        # Processor missing patch/merge/min/max -> never under-count.
+        messages = [{"role": "user", "content": [_image_part(512, 512)]}]
+        total = _count_image_tokens_real(messages, SimpleNamespace(),
+                                         upper_bound=16384)
+        assert total == 16384
+
+    def test_no_images_returns_zero(self):
+        from omlx.engine.vlm import _count_image_tokens_real
+
+        messages = [{"role": "user", "content": "just text"}]
+        assert _count_image_tokens_real(messages, _QWEN_PROC) == 0

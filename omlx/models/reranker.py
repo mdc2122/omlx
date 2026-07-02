@@ -11,6 +11,7 @@ Supports:
 - CausalLM-based rerankers (e.g., Qwen3-Reranker) via yes/no logit scoring
 """
 
+import gc
 import json
 import logging
 from dataclasses import dataclass
@@ -25,6 +26,7 @@ from ..model_discovery import (
     SUPPORTED_RERANKER_ARCHITECTURES,
     _is_causal_lm_reranker,
 )
+from ..utils.compile_cache import clear_thread_compile_cache
 from ..utils.image import load_image
 from .mlx_embeddings_compat import (
     patch_qwen3_vl_processor_for_torch_free_image_loading,
@@ -84,7 +86,7 @@ class MLXRerankerModel:
     # CausalLM reranker prompt template (Qwen3-Reranker format)
     _CAUSAL_LM_SYSTEM_PROMPT = (
         "Judge whether the Document meets the requirements based on the "
-        'Query and the Instruct provided. Note that the answer can only be '
+        "Query and the Instruct provided. Note that the answer can only be "
         '"yes" or "no".'
     )
     _CAUSAL_LM_DEFAULT_INSTRUCTION = (
@@ -148,10 +150,13 @@ class MLXRerankerModel:
         with open(model_path / "config.json") as f:
             config_dict = json.load(f)
 
-        config = ModelArgs(**{
-            k: v for k, v in config_dict.items()
-            if k in ModelArgs.__dataclass_fields__
-        })
+        config = ModelArgs(
+            **{
+                k: v
+                for k, v in config_dict.items()
+                if k in ModelArgs.__dataclass_fields__
+            }
+        )
 
         # Create model
         model = Model(config)
@@ -198,9 +203,7 @@ class MLXRerankerModel:
             tokenizer_config={"trust_remote_code": self.trust_remote_code},
         )
 
-    def _build_vl_item(
-        self, item: "str | dict[str, Any]"
-    ) -> Dict[str, Any]:
+    def _build_vl_item(self, item: "str | dict[str, Any]") -> Dict[str, Any]:
         """Normalize a rerank input into the mlx-embeddings VL item format.
 
         Accepts either a bare string (text) or a dict with 'text' and/or
@@ -224,9 +227,7 @@ class MLXRerankerModel:
                 # Already a PIL image or similar — pass through
                 result["image"] = image_ref
         if not result:
-            raise ValueError(
-                "VL reranker item must have at least 'text' or 'image'."
-            )
+            raise ValueError("VL reranker item must have at least 'text' or 'image'.")
         return result
 
     def _rerank_vl(
@@ -262,9 +263,10 @@ class MLXRerankerModel:
 
     def _load_causal_lm(self) -> Tuple[Any, Any]:
         """Load a CausalLM-based reranker model using mlx-lm."""
-        from mlx_lm import load as mlx_lm_load
-
-        from ..utils.model_loading import maybe_load_custom_quantization
+        from ..utils.model_loading import (
+            lm_load_compat as mlx_lm_load,
+            maybe_load_custom_quantization,
+        )
 
         model_path = str(self.model_name)
         tokenizer_config = {"trust_remote_code": self.trust_remote_code}
@@ -278,6 +280,7 @@ class MLXRerankerModel:
             loaded = mlx_lm_load(
                 model_path,
                 tokenizer_config=tokenizer_config,
+                trust_remote_code=self.trust_remote_code,
             )
             model = loaded[0]
             tokenizer_wrapper = loaded[1]
@@ -336,9 +339,10 @@ class MLXRerankerModel:
         Jina v3 reranker uses special-token hidden states + projector + cosine
         similarity for listwise scoring.
         """
-        from mlx_lm import load as mlx_lm_load
-
-        from ..utils.model_loading import maybe_load_custom_quantization
+        from ..utils.model_loading import (
+            lm_load_compat as mlx_lm_load,
+            maybe_load_custom_quantization,
+        )
 
         model_path = str(self.model_name)
         tokenizer_config = {"trust_remote_code": self.trust_remote_code}
@@ -352,6 +356,7 @@ class MLXRerankerModel:
             loaded = mlx_lm_load(
                 model_path,
                 tokenizer_config=tokenizer_config,
+                trust_remote_code=self.trust_remote_code,
             )
             model = loaded[0]
             tokenizer_wrapper = loaded[1]
@@ -689,9 +694,7 @@ class MLXRerankerModel:
             # CausalLM / VL reranker paths use custom scoring (yes/no logits or
             # mlx-embeddings model.process). VL forward needs pixel_values and
             # lacks pooler_output, so the compile wrapper here wouldn't apply.
-            logger.info(
-                f"mx.compile skipped for {self.model_name}"
-            )
+            logger.info(f"mx.compile skipped for {self.model_name}")
             self._compiled_seq_logits = None
             return False
 
@@ -702,7 +705,10 @@ class MLXRerankerModel:
 
             def _compiled_seq_logits(inputs):
                 outputs = base_model(**inputs)
-                if hasattr(outputs, "pooler_output") and outputs.pooler_output is not None:
+                if (
+                    hasattr(outputs, "pooler_output")
+                    and outputs.pooler_output is not None
+                ):
                     return outputs.pooler_output
                 raise ValueError(
                     "Model output does not contain pooler_output. "
@@ -726,11 +732,35 @@ class MLXRerankerModel:
             )
             return True
         except Exception as e:
-            logger.info(
-                f"mx.compile unavailable for {self.model_name}: {e}"
-            )
+            logger.info(f"mx.compile unavailable for {self.model_name}: {e}")
             self._compiled_seq_logits = None
             return False
+
+    def close(self) -> None:
+        """Release model, processor, projector, and compiled reranker resources."""
+        self._compiled_seq_logits = None
+        self._is_compiled = False
+
+        self.model = None
+        self.processor = None
+        self._loaded = False
+        self._num_labels = None
+        self._is_causal_lm = False
+        self._is_jina_reranker = False
+        self._is_vl_reranker = False
+        self._token_true_id = None
+        self._token_false_id = None
+        self._doc_embed_token_id = None
+        self._query_embed_token_id = None
+        self._jina_projector = None
+        self._prefix_tokens = None
+        self._suffix_tokens = None
+
+        gc.collect()
+        mx.synchronize()
+        mx.clear_cache()
+        clear_thread_compile_cache()
+        gc.collect()
 
     # Default max_length per model type
     _DEFAULT_MAX_LENGTH_SEQ_CLASSIFICATION = 512

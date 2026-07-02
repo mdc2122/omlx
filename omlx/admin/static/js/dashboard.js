@@ -86,7 +86,7 @@
             // Global settings
             globalSettings: {
                 base_path: '',
-                server: { host: '127.0.0.1', port: 8000, log_level: 'info', sse_keepalive_mode: 'chunk', burst_decode_mode: 'balanced' },
+                server: { host: '127.0.0.1', port: 8000, log_level: 'info', sse_keepalive_mode: 'chunk', burst_decode_mode: 'balanced', preserve_mid_system_cache: true },
                 model: { model_dirs: [''] },
                 memory: { prefill_memory_guard: true, memory_guard_tier: 'balanced', memory_guard_custom_ceiling_gb: 0 },
                 scheduler: { max_concurrent_requests: 8, embedding_batch_size: 32, chunked_prefill: false },
@@ -106,7 +106,7 @@
                     pi_model: null,
                     openclaw_tools_profile: 'full',
                     markitdown_enabled: true,
-                    markitdown_expose_model: true,
+                    markitdown_expose_model: false,
                     markitdown_max_file_size_mb: 25,
                     markitdown_max_files_per_request: 5,
                     markitdown_pdf_processing_engine: 'markitdown',
@@ -187,7 +187,7 @@
             _applySeq: 0,               // monotonic counter for apply race guard
             profileError: '',
             showNewProfileForm: false,
-            newProfile: { name: '', display_name: '', description: '', also_as_template: false },
+            newProfile: { display_name: '', api_name: '', api_name_touched: false, description: '', also_as_template: false },
             showNewTemplateForm: false,
             newTemplate: { name: '', display_name: '', description: '' },
             editingProfile: null,        // profile name being edited inline
@@ -404,6 +404,10 @@
             oqDtype: 'bfloat16',
             oqSensitivityModelPath: '',
             oqPreserveMtp: false,
+            oqEnhanced: false,
+            oqeReuseImatrixCache: true,
+            oqeImatrixCachePath: '',
+            oqeStrictImatrix: false,
 
             // oQ Uploader state
             uploadHfToken: localStorage.getItem('omlx-hf-upload-token') || '',
@@ -841,6 +845,7 @@
                             log_level: this.globalSettings.server.log_level,
                             sse_keepalive_mode: this.globalSettings.server.sse_keepalive_mode,
                             burst_decode_mode: this.globalSettings.server.burst_decode_mode,
+                            preserve_mid_system_cache: this.globalSettings.server.preserve_mid_system_cache,
                             model_dirs: this.globalSettings.model.model_dirs.filter(d => d.trim()),
                             model_fallback: this.globalSettings.model.model_fallback,
                             memory_prefill_memory_guard: this.globalSettings.memory.prefill_memory_guard,
@@ -1188,6 +1193,15 @@
                 }
                 return null;
             },
+            profileTooltip(profile) {
+                const lines = [];
+                if (profile?.expose_as_model && profile.model_id) {
+                    lines.push(profile.model_id);
+                }
+                const description = (profile?.description || '').trim();
+                if (description) lines.push(description);
+                return lines.join('\n');
+            },
             async loadProfilesForModel(modelId) {
                 this.profiles = [];
                 try {
@@ -1334,10 +1348,8 @@
             },
 
             isSpecPrefillDraftModel(model) {
-                const text = this.draftModelSearchText(model);
                 return !this.isDflashDraftModel(model)
-                    && !this.isVlmMtpDraftModel(model)
-                    && !/(^|[-_/\s])mtp($|[-_/\s])/i.test(text);
+                    && !this.isVlmMtpDraftModel(model);
             },
 
             draftModelCandidates(filterFn, { fallbackToBase = true } = {}) {
@@ -1537,21 +1549,44 @@
                 try { localStorage.setItem('omlx_profile_scope', scope); } catch (e) {}
             },
 
+            isValidProfileName(name) {
+                // Mirror of the backend rule (validate_profile_name) and the
+                // Mac app's isValidSlug. api_name is the exposed model ID
+                // suffix (<model>:<api_name>), so it must be a clean slug.
+                return /^[a-z0-9][a-z0-9_-]{0,31}$/.test((name || '').trim());
+            },
+            slugifyProfileApiName(value) {
+                let slug = (value || '')
+                    .normalize('NFKD')
+                    .replace(/[\u0300-\u036f]/g, '')
+                    .toLowerCase()
+                    .replace(/[^a-z0-9_-]+/g, '-')
+                    .replace(/-+/g, '-')
+                    .replace(/^[-_]+|[-_]+$/g, '')
+                    .slice(0, 32)
+                    .replace(/[-_]+$/g, '');
+                return slug || 'profile';
+            },
             async createProfile() {
                 if (!this.selectedModel) return;
                 this.profileError = '';
-                const displayName = this.newProfile.display_name.trim();
+                const displayName = (this.newProfile.display_name || '').trim();
                 if (!displayName) {
                     this.profileError = 'Name required';
                     return;
                 }
-                // Auto-generate short unique slug (matches backend ^[a-z0-9][a-z0-9_-]{0,31}$)
+                const apiName = (this.newProfile.api_name || this.slugifyProfileApiName(displayName)).trim();
+                if (!this.isValidProfileName(apiName)) {
+                    this.profileError = window.t('modal.model_settings.profiles.invalid_name');
+                    return;
+                }
                 const autoId = 'p-' + Date.now().toString(36) + '-' +
                                Math.random().toString(36).slice(2, 6);
                 const body = {
                     name: autoId,
                     display_name: displayName,
-                    description: this.newProfile.description.trim() || null,
+                    api_name: apiName,
+                    description: (this.newProfile.description || '').trim() || null,
                     settings: this.formValuesForProfile(),
                     also_save_as_template: false,
                 };
@@ -1565,7 +1600,7 @@
                         await this.loadProfilesForModel(this.selectedModel.id);
                         if (body.also_save_as_template) await this.loadTemplates();
                         this.showNewProfileForm = false;
-                        this.newProfile = { name: '', display_name: '', description: '', also_as_template: false };
+                        this.newProfile = { display_name: '', api_name: '', api_name_touched: false, description: '', also_as_template: false };
                     } else if (r.status === 401) {
                         window.location.href = '/admin';
                     } else {
@@ -1628,6 +1663,7 @@
                     const body = {
                         name: template.name,
                         display_name: template.display_name,
+                        api_name: this.slugifyProfileApiName(template.display_name || template.name),
                         description: template.description || null,
                         settings: template.settings,
                         source_template: template.name,
@@ -1672,8 +1708,37 @@
                     this.profileDeleteConfirm = null;
                 }
             },
+            updateProfileFromEdit(p) {
+                // Edit-dialog save. Internal profile name stays stable; api_name
+                // is the API-visible suffix used by exposed model IDs.
+                this.profileError = '';
+                const displayName = (p._editDisplayName ?? p.display_name ?? p.name).trim();
+                const apiName = (p._editApiName ?? p.api_name ?? p.name).trim();
+                const description = (p._editDescription ?? p.description ?? '').trim();
+                const exposeAsModel = !!(p._editExposeAsModel ?? p.expose_as_model);
+                if (!displayName) {
+                    this.profileError = 'Name required';
+                    return;
+                }
+                if (!this.isValidProfileName(apiName)) {
+                    this.profileError = window.t('modal.model_settings.profiles.invalid_name');
+                    return;
+                }
+                const patch = {
+                    display_name: displayName,
+                    api_name: apiName,
+                    description: description,
+                    expose_as_model: exposeAsModel,
+                };
+                return this.updateProfile(p.name, patch);
+            },
+            updateProfileSettingsFromForm(p) {
+                return this.updateProfile(p.name, {
+                    settings: this.formValuesForProfile(),
+                });
+            },
             async updateProfile(name, patch) {
-                // patch: { new_name?, display_name?, description?, settings?, also_save_as_template? }
+                // patch: { new_name?, display_name?, api_name?, description?, expose_as_model?, settings?, also_save_as_template? }
                 if (!this.selectedModel) return;
                 this.profileError = '';
                 try {
@@ -2338,6 +2403,10 @@
 
             get codexCommand() {
                 return this._launchCmd('codex');
+            },
+
+            get codexAppCommand() {
+                return this._launchCmd('codex_app');
             },
 
             get copilotCommand() {
@@ -3886,8 +3955,8 @@
 
                     switch (this.sortBy) {
                         case 'id':
-                            aVal = (a.id || '').toLowerCase();
-                            bVal = (b.id || '').toLowerCase();
+                            aVal = (a.display_name || a.id || '').toLowerCase();
+                            bVal = (b.display_name || b.id || '').toLowerCase();
                             break;
                         case 'type':
                             aVal = (a.model_type || 'llm').toLowerCase();
@@ -4198,24 +4267,31 @@
                 this.oqSuccess = '';
                 this.oqStarting = true;
                 try {
+                    const payload = {
+                        model_path: this.oqSelectedModelPath,
+                        oq_level: this.oqLevel,
+                        group_size: 64,
+                        sensitivity_model_path: this.oqSensitivityModelPath,
+                        text_only: this.oqTextOnly,
+                        dtype: this.oqDtype,
+                        preserve_mtp: this.oqSelectedModelHasMtp() ? this.oqPreserveMtp : false,
+                    };
+                    if (this.oqEnhanced) {
+                        payload.enhanced = true;
+                        payload.imatrix_reuse_cache = this.oqeReuseImatrixCache;
+                        payload.imatrix_cache_path = this.oqeImatrixCachePath.trim();
+                        payload.imatrix_strict = this.oqeStrictImatrix;
+                    }
                     const response = await fetch('/admin/api/oq/start', {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({
-                            model_path: this.oqSelectedModelPath,
-                            oq_level: this.oqLevel,
-                            group_size: 64,
-                            sensitivity_model_path: this.oqSensitivityModelPath,
-                            text_only: this.oqTextOnly,
-                            dtype: this.oqDtype,
-                            preserve_mtp: this.oqSelectedModelHasMtp() ? this.oqPreserveMtp : false,
-                        }),
+                        body: JSON.stringify(payload),
                     });
                     const data = await response.json().catch(() => ({}));
                     if (response.ok) {
                         const model = this.oqModels.find(m => m.path === this.oqSelectedModelPath);
                         const name = model ? model.name : this.oqSelectedModelPath;
-                        this.oqSuccess = `Quantization started: ${name} → oQ${this.oqLevel}`;
+                        this.oqSuccess = `Quantization started: ${name} → oQ${this.oqLevel}${this.oqEnhanced ? 'e' : ''}`;
                         await this.loadOQTasks();
                         this.startOQRefresh();
                         setTimeout(() => { this.oqSuccess = ''; }, 5000);
@@ -4285,7 +4361,8 @@
 
             formatOQProgress(task) {
                 const pct = Math.round(task.progress || 0);
-                return `${pct}% · ${task.phase || task.status}`;
+                const label = task.progress_detail || task.phase || task.status;
+                return `${pct}% · ${label}`;
             },
 
             formatOQElapsed(task) {
@@ -4306,6 +4383,10 @@
                     m.is_quantized &&
                     m.model_type === source.model_type
                 );
+            },
+
+            oqLevelLabel(level) {
+                return `oQ${level}${this.oqEnhanced ? 'e' : ''}`;
             },
 
             oqSelectedModelIsVLM() {

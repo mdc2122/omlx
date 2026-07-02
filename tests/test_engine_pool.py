@@ -4,7 +4,7 @@
 import asyncio
 import json
 import logging
-from pathlib import Path
+import shutil
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -12,9 +12,11 @@ import pytest
 from omlx.engine_pool import EngineEntry, EnginePool
 from omlx.exceptions import (
     InsufficientMemoryError,
+    ModelBusyError,
     ModelLoadingError,
     ModelNotFoundError,
     ModelTooLargeError,
+    ModelUnavailableError,
 )
 from omlx.scheduler import PrefillEvictionRequest
 
@@ -127,6 +129,48 @@ class TestEnginePoolInit:
         entry_b = pool.get_entry("model-b")
         assert entry_b is not None
         assert entry_b.is_pinned is False
+
+
+class TestExposedProfileModelResolution:
+    """Tests for exposed profile model IDs that share a physical engine."""
+
+    def _manager_with_exposed_profile(self, tmp_path):
+        from omlx.model_settings import ModelSettingsManager
+
+        manager = ModelSettingsManager(tmp_path)
+        manager.save_profile(
+            model_id="model-b",
+            name="thinking",
+            display_name="Thinking",
+            description=None,
+            settings={"enable_thinking": True},
+            expose_as_model=True,
+        )
+        return manager
+
+    def test_resolve_model_id_maps_exposed_profile_to_source_model(
+        self, small_mock_model_dir, tmp_path
+    ):
+        """Exposed profile model IDs resolve to their base model for loading."""
+        pool = _make_pool(ceiling=10 * 1024**3)
+        pool.discover_models(str(small_mock_model_dir))
+        manager = self._manager_with_exposed_profile(tmp_path)
+
+        resolved = pool.resolve_model_id("model-b:thinking", manager)
+
+        assert resolved == "model-b"
+
+    def test_resolve_model_id_maps_provider_prefixed_exposed_profile_to_source(
+        self, small_mock_model_dir, tmp_path
+    ):
+        """Provider prefixes do not prevent exposed profile resolution."""
+        pool = _make_pool(ceiling=10 * 1024**3)
+        pool.discover_models(str(small_mock_model_dir))
+        manager = self._manager_with_exposed_profile(tmp_path)
+
+        resolved = pool.resolve_model_id("omlx/model-b:thinking", manager)
+
+        assert resolved == "model-b"
 
 
 class TestDiscoverModelsMerge:
@@ -250,6 +294,19 @@ class TestEnginePoolErrors:
 
         assert exc_info.value.model_id == "model-a"
         assert exc_info.value.ceiling == 100
+
+    def test_missing_model_path_removes_unloaded_entry(self, small_mock_model_dir):
+        """A deleted model directory is removed and reported as not found."""
+        pool = _make_pool(ceiling=10 * 1024**3)
+        pool.discover_models(str(small_mock_model_dir))
+
+        shutil.rmtree(small_mock_model_dir / "model-a")
+
+        with pytest.raises(ModelNotFoundError) as exc_info:
+            asyncio.run(pool.get_engine("model-a"))
+
+        assert exc_info.value.model_id == "model-a"
+        assert pool.get_entry("model-a") is None
 
 
 class TestEnginePoolStatus:
@@ -490,8 +547,8 @@ class TestVLMFallback:
         self, small_mock_model_dir
     ):
         """When VLM start fails AND the LLM fallback also fails, the raised
-        RuntimeError should embed both messages and chain ``__cause__`` to the
-        original VLM error (PR #1283)."""
+        unavailable error should embed both messages and preserve the original
+        fallback RuntimeError in the cause chain (PR #1283)."""
         pool = _make_pool(ceiling=10 * 1024**3)
         pool.discover_models(str(small_mock_model_dir))
 
@@ -513,7 +570,7 @@ class TestVLMFallback:
         with (
             patch("omlx.engine_pool.VLMBatchedEngine", return_value=mock_vlm_engine),
             patch("omlx.engine_pool.BatchedEngine", return_value=mock_batched_engine),
-            pytest.raises(RuntimeError) as excinfo,
+            pytest.raises(ModelUnavailableError) as excinfo,
         ):
             await pool._load_engine("model-a")
 
@@ -522,17 +579,20 @@ class TestVLMFallback:
         assert "Missing vision_tower parameters" in msg
         assert "LLM fallback also failed" in msg
         assert "Model type lfm2_vl not supported" in msg
-        # __cause__ chain preserves the original VLM error
         assert excinfo.value.__cause__ is not None
-        assert "Missing vision_tower parameters" in str(excinfo.value.__cause__)
+        assert isinstance(excinfo.value.__cause__, RuntimeError)
+        assert excinfo.value.__cause__.__cause__ is not None
+        assert "Missing vision_tower parameters" in str(
+            excinfo.value.__cause__.__cause__
+        )
 
     @pytest.mark.asyncio
     async def test_force_lm_fallback_to_vlm_both_fail_surfaces_both_errors(
         self, small_mock_model_dir
     ):
         """force_lm path: LM start fails AND VLM fallback also fails. Both
-        error messages should land in the raised RuntimeError, with the LM
-        error as ``__cause__`` (PR #1283)."""
+        error messages should land in the unavailable error, with the LM
+        error preserved in the cause chain (PR #1283)."""
         pool = _make_pool(ceiling=10 * 1024**3)
         pool.discover_models(str(small_mock_model_dir))
 
@@ -557,7 +617,7 @@ class TestVLMFallback:
         with (
             patch("omlx.engine_pool.BatchedEngine", return_value=mock_batched_engine),
             patch("omlx.engine_pool.VLMBatchedEngine", return_value=mock_vlm_engine),
-            pytest.raises(RuntimeError) as excinfo,
+            pytest.raises(ModelUnavailableError) as excinfo,
         ):
             await pool._load_engine("model-a", force_lm=True)
 
@@ -567,7 +627,8 @@ class TestVLMFallback:
         assert "tie_word_embeddings" in msg
         assert "VLM fallback also failed" in msg
         assert "vision encoder weights missing" in msg
-        assert isinstance(excinfo.value.__cause__, TypeError)
+        assert isinstance(excinfo.value.__cause__, RuntimeError)
+        assert isinstance(excinfo.value.__cause__.__cause__, TypeError)
 
 
 class TestEnginePoolLRU:
@@ -700,9 +761,7 @@ class TestEnginePoolDFlashIsolation:
     @pytest.mark.asyncio
     async def test_unload_other_dflash_engines_unloads_idle_dflash_only(self):
         pool = EnginePool()
-        pool._entries["old-dflash"] = self._entry(
-            "old-dflash", self.DFlashEngine()
-        )
+        pool._entries["old-dflash"] = self._entry("old-dflash", self.DFlashEngine())
         pool._entries["other"] = self._entry("other", self.OtherEngine())
         pool._entries["new-dflash"] = self._entry("new-dflash", None)
 
@@ -763,12 +822,206 @@ class TestEnginePoolAsync:
         assert pool.current_model_memory > 0
 
     @pytest.mark.asyncio
+    async def test_load_failure_is_cached_until_discovery_refresh(
+        self, pool_with_mock_engines, small_mock_model_dir
+    ):
+        """A failed model load is not retried until the model list is refreshed."""
+        pool = pool_with_mock_engines
+
+        mock_engine = MagicMock()
+        mock_engine.start = AsyncMock(side_effect=RuntimeError("broken weights"))
+        mock_engine.stop = AsyncMock()
+
+        with patch("omlx.engine_pool.BatchedEngine", return_value=mock_engine):
+            with pytest.raises(ModelUnavailableError):
+                await pool.get_engine("model-a")
+            with pytest.raises(ModelUnavailableError):
+                await pool.get_engine("model-a")
+
+        assert mock_engine.start.await_count == 1
+        entry = pool.get_entry("model-a")
+        assert entry is not None
+        assert entry.load_failed is True
+        assert "broken weights" in (entry.load_failure_message or "")
+
+        pool.discover_models(str(small_mock_model_dir))
+        refreshed = pool.get_entry("model-a")
+        assert refreshed is not None
+        assert refreshed.load_failed is False
+
+    @pytest.mark.asyncio
+    async def test_runtime_settings_signature_reload(self, pool_with_mock_engines):
+        """A profile runtime variant with engine fields reloads the base engine."""
+        from omlx.model_settings import ModelSettings
+
+        pool = pool_with_mock_engines
+        pool._settings_manager = MagicMock()
+        pool._settings_manager.get_settings.return_value = ModelSettings(
+            mtp_enabled=False
+        )
+
+        base_engine = MagicMock()
+        base_engine.start = AsyncMock()
+        base_engine.stop = AsyncMock()
+        profile_engine = MagicMock()
+        profile_engine.start = AsyncMock()
+        profile_engine.stop = AsyncMock()
+
+        with patch(
+            "omlx.engine_pool.BatchedEngine",
+            side_effect=[base_engine, profile_engine],
+        ):
+            first = await pool.get_engine("model-a")
+            second = await pool.get_engine(
+                "model-a",
+                runtime_settings=ModelSettings(mtp_enabled=True),
+            )
+
+        assert first is base_engine
+        assert second is profile_engine
+        base_engine.stop.assert_awaited_once()
+        assert pool.get_entry("model-a").runtime_settings_signature == (
+            pool._engine_runtime_signature(
+                "model-a",
+                ModelSettings(mtp_enabled=True),
+            )
+        )
+
+    @pytest.mark.asyncio
+    async def test_runtime_settings_reload_rejected_while_leased(
+        self, pool_with_mock_engines
+    ):
+        """A profile variant switch must not unload an engine held by a request."""
+        from omlx.model_settings import ModelSettings
+
+        pool = pool_with_mock_engines
+        pool._settings_manager = MagicMock()
+        pool._settings_manager.get_settings.return_value = ModelSettings(
+            mtp_enabled=False
+        )
+
+        base_engine = MagicMock()
+        base_engine.start = AsyncMock()
+        base_engine.stop = AsyncMock()
+
+        with patch("omlx.engine_pool.BatchedEngine", return_value=base_engine):
+            first = await pool.get_engine("model-a")
+            pool.get_entry("model-a").in_use = 1
+            with pytest.raises(ModelBusyError, match="runtime settings variant"):
+                await pool.get_engine(
+                    "model-a",
+                    runtime_settings=ModelSettings(mtp_enabled=True),
+                )
+
+        assert first is base_engine
+        assert pool.get_entry("model-a").engine is base_engine
+        base_engine.stop.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_runtime_sampling_only_profile_reuses_loaded_engine(
+        self, pool_with_mock_engines
+    ):
+        from omlx.model_settings import ModelSettings
+
+        pool = pool_with_mock_engines
+        pool._settings_manager = MagicMock()
+        pool._settings_manager.get_settings.return_value = ModelSettings(
+            mtp_enabled=False
+        )
+
+        base_engine = MagicMock()
+        base_engine.start = AsyncMock()
+        base_engine.stop = AsyncMock()
+
+        with patch("omlx.engine_pool.BatchedEngine", return_value=base_engine):
+            first = await pool.get_engine("model-a")
+            second = await pool.get_engine(
+                "model-a",
+                runtime_settings=ModelSettings(temperature=0.9, mtp_enabled=False),
+            )
+
+        assert first is base_engine
+        assert second is base_engine
+        base_engine.stop.assert_not_awaited()
+
+    def test_runtime_signature_ignores_request_only_profile_fields(
+        self, pool_with_mock_engines
+    ):
+        from omlx.model_settings import ModelSettings
+
+        pool = pool_with_mock_engines
+
+        pure = ModelSettings(
+            enable_thinking=False,
+            dflash_enabled=False,
+            dflash_draft_model="/stale/draft",
+            vlm_mtp_enabled=False,
+            vlm_mtp_draft_model="/stale/assistant",
+        )
+        pure_think = ModelSettings(
+            enable_thinking=True,
+            dflash_enabled=False,
+            dflash_draft_model=None,
+            vlm_mtp_enabled=False,
+            vlm_mtp_draft_model=None,
+        )
+        dflash = ModelSettings(
+            dflash_enabled=True,
+            dflash_draft_model="/draft",
+        )
+        vlm_mtp = ModelSettings(
+            vlm_mtp_enabled=True,
+            vlm_mtp_draft_model="/assistant",
+        )
+
+        pure_signature = pool._engine_runtime_signature("model-a", pure)
+        pure_think_signature = pool._engine_runtime_signature("model-a", pure_think)
+
+        assert pure_signature == pure_think_signature
+        assert pool._engine_runtime_signature("model-a", dflash) != pure_signature
+        assert pool._engine_runtime_signature("model-a", vlm_mtp) != pure_signature
+
+    @pytest.mark.asyncio
+    async def test_base_request_reloads_after_profile_variant(
+        self, pool_with_mock_engines
+    ):
+        from omlx.model_settings import ModelSettings
+
+        pool = pool_with_mock_engines
+        pool._settings_manager = MagicMock()
+        pool._settings_manager.get_settings.return_value = ModelSettings(
+            mtp_enabled=False
+        )
+
+        profile_engine = MagicMock()
+        profile_engine.start = AsyncMock()
+        profile_engine.stop = AsyncMock()
+        base_engine = MagicMock()
+        base_engine.start = AsyncMock()
+        base_engine.stop = AsyncMock()
+
+        with patch(
+            "omlx.engine_pool.BatchedEngine",
+            side_effect=[profile_engine, base_engine],
+        ):
+            first = await pool.get_engine(
+                "model-a",
+                runtime_settings=ModelSettings(mtp_enabled=True),
+            )
+            second = await pool.get_engine("model-a")
+
+        assert first is profile_engine
+        assert second is base_engine
+        profile_engine.stop.assert_awaited_once()
+
+    @pytest.mark.asyncio
     async def test_embedding_engine_receives_scheduler_config(self, tmp_path):
         """Embedding chunk sizing should come from the shared scheduler config."""
         from omlx.scheduler import SchedulerConfig
 
         model_path = tmp_path / "embed-model"
         model_path.mkdir()
+        (model_path / "config.json").write_text(json.dumps({"model_type": "bert"}))
         scheduler_config = SchedulerConfig(
             completion_batch_size=6,
             embedding_batch_size=4,
@@ -806,6 +1059,7 @@ class TestEnginePoolAsync:
         """A bare EnginePool should pass its fallback scheduler config consistently."""
         model_path = tmp_path / "embed-model"
         model_path.mkdir()
+        (model_path / "config.json").write_text(json.dumps({"model_type": "bert"}))
         pool = _make_pool(ceiling=10 * 1024**3)
         pool._entries["embed-model"] = EngineEntry(
             model_id="embed-model",
@@ -1453,6 +1707,7 @@ class TestResolveModelId:
         pool.discover_models(str(small_mock_model_dir))
 
         settings_manager = MagicMock()
+        settings_manager.get_exposed_profile_source_model_id.return_value = None
         from omlx.model_settings import ModelSettings
 
         settings_manager.get_all_settings.return_value = {
@@ -1469,6 +1724,7 @@ class TestResolveModelId:
         pool.discover_models(str(small_mock_model_dir))
 
         settings_manager = MagicMock()
+        settings_manager.get_exposed_profile_source_model_id.return_value = None
         from omlx.model_settings import ModelSettings
 
         settings_manager.get_all_settings.return_value = {
@@ -1492,6 +1748,7 @@ class TestResolveModelId:
         pool.discover_models(str(small_mock_model_dir))
 
         settings_manager = MagicMock()
+        settings_manager.get_exposed_profile_source_model_id.return_value = None
         from omlx.model_settings import ModelSettings
 
         settings_manager.get_all_settings.return_value = {
@@ -1516,6 +1773,7 @@ class TestResolveModelId:
         pool.discover_models(str(small_mock_model_dir))
 
         settings_manager = MagicMock()
+        settings_manager.get_exposed_profile_source_model_id.return_value = None
         from omlx.model_settings import ModelSettings
 
         settings_manager.get_all_settings.return_value = {
@@ -1921,9 +2179,7 @@ class TestMemorySettleBarrier:
         assert mock_mx.synchronize.call_count == 14
         assert mock_mx.clear_cache.call_count == 14
 
-    def test_other_entries_serving_in_use_lease_counts(
-        self, pool_with_loaded_model
-    ):
+    def test_other_entries_serving_in_use_lease_counts(self, pool_with_loaded_model):
         """The in-use lease (acquired but not yet active) also marks the pool
         as serving — eviction paths already treat it as activity (#1667).
         """
@@ -2046,6 +2302,43 @@ class TestEnginePoolInUseLease:
         await pool.release_engine("nope")
 
     @pytest.mark.asyncio
+    async def test_release_engine_unloads_pending_after_lease_drains(self):
+        """Pending hard-pressure unload runs as soon as the lease drains."""
+        pool = _make_pool(ceiling=0)
+        entry = self._loaded_entry("leased")
+        entry.in_use = 1
+        entry.pending_unload_reason = "hard memory pressure"
+        entry.abort_requested = True
+        pool._entries = {"leased": entry}
+        pool._unload_engine = AsyncMock()
+
+        await pool.release_engine("leased")
+
+        assert entry.in_use == 0
+        assert entry.pending_unload_reason is None
+        assert entry.abort_requested is False
+        pool._unload_engine.assert_awaited_once_with("leased")
+
+    @pytest.mark.asyncio
+    async def test_release_engine_keeps_pending_while_scheduler_active(self):
+        """A drained lease is not enough if scheduler requests are still active."""
+        pool = _make_pool(ceiling=0)
+        entry = self._loaded_entry("leased")
+        entry.in_use = 1
+        entry.engine.has_active_requests.return_value = True
+        entry.pending_unload_reason = "hard memory pressure"
+        entry.abort_requested = True
+        pool._entries = {"leased": entry}
+        pool._unload_engine = AsyncMock()
+
+        await pool.release_engine("leased")
+
+        assert entry.in_use == 0
+        assert entry.pending_unload_reason == "hard memory pressure"
+        assert entry.abort_requested is True
+        pool._unload_engine.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_acquire_leases_then_releases_on_success(self):
         """acquire() leases on enter and releases in finally on normal exit."""
         pool = _make_pool(ceiling=0)
@@ -2069,6 +2362,23 @@ class TestEnginePoolInUseLease:
                 assert entry.in_use == 1
                 raise RuntimeError("boom")
         assert entry.in_use == 0  # no leaked lease
+
+    @pytest.mark.asyncio
+    async def test_get_engine_rejects_loaded_llm_without_tokenizer(self):
+        """A stale/half-loaded LLM engine must not reach chat tokenization."""
+        from omlx.engine.batched import BatchedEngine
+
+        pool = _make_pool(ceiling=0)
+        engine = BatchedEngine.__new__(BatchedEngine)
+        engine._tokenizer = None
+        entry = self._loaded_entry("model-a")
+        entry.engine = engine
+        entry.model_type = "llm"
+        entry.engine_type = "batched"
+        pool._entries = {"model-a": entry}
+
+        with pytest.raises(ModelLoadingError, match="usable tokenizer"):
+            await pool.get_engine("model-a")
 
 
 class TestResetActivityTracking:

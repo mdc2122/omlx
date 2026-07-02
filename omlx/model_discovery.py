@@ -59,6 +59,7 @@ VLM_MODEL_TYPES = {
     "deepseekocr_2",
     "dots_ocr",
     "glm_ocr",
+    "minimax_m3_vl",
     "minicpmv",
     "phi4_siglip",
     "phi4mm",
@@ -70,6 +71,7 @@ VLM_MODEL_TYPES = {
 # models and adapts their language model to oMLX's scheduler.
 VLM_NATIVE_TEXT_MODEL_TYPES = {
     "cohere2_moe",
+    "minimax_m3",
 }
 
 # Known VLM architectures
@@ -145,6 +147,9 @@ CAUSAL_LM_RERANKER_ARCHITECTURES = {
 # (no lm_head weights). Detected by architecture + directory name heuristic.
 CAUSAL_LM_EMBEDDING_ARCHITECTURES = {
     "Qwen3ForCausalLM",  # Qwen3-Embedding uses CausalLM arch without lm_head
+    "Qwen2ForCausalLM",  # jina-code-embeddings & similar; only treated as an
+    # embedding when the dir-name heuristic (_is_causal_lm_embedding) also
+    # matches, so Qwen2/Qwen2.5 chat models are unaffected.
 }
 
 # Multimodal (VLM-based) reranker architectures.
