@@ -1287,6 +1287,24 @@ class TestSchedulerQueryMethods:
 
         assert scheduler.has_requests() is True
 
+    def test_has_requests_with_pending_abort(self, mock_model, mock_tokenizer):
+        """A deferred abort is scheduler-visible work.
+
+        An abort enqueued against a request no longer in waiting/running
+        (external prefill hand-off) must keep the engine loop stepping so
+        _process_pending_aborts() runs; otherwise its cleanup is stranded
+        until an unrelated request arrives (abort-wedge contributor,
+        2026-07-09)."""
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        scheduler.abort_request("req-gone")
+
+        assert scheduler.has_requests() is True
+
+        # step() drains it and returns the scheduler to idle.
+        scheduler.step()
+        assert scheduler._pending_abort_ids == set()
+        assert scheduler.has_requests() is False
+
     def test_get_num_waiting(self, mock_model, mock_tokenizer):
         """Test get_num_waiting() returns correct count."""
         scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)

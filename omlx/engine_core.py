@@ -173,6 +173,16 @@ class EngineConfig:
             os.environ.get("OMLX_DECODE_BURST_BUDGET_S", "0.03")
         )
     )
+    # Watchdog for a single executor step burst. A healthy burst is bounded
+    # by decode_burst_budget_s (~0.1 s) plus one prefill chunk; if a burst
+    # exceeds this, the MLX executor thread is almost certainly wedged in a
+    # native call (observed: abort-path mx.synchronize / batch removal,
+    # 2026-07-09). Python cannot kill a blocked native thread, so recovery
+    # is: log the scheduler state, error out every waiting client (instead
+    # of keepalives forever), and keep waiting. <= 0 disables.
+    step_watchdog_s: float = field(
+        default_factory=lambda: float(os.environ.get("OMLX_STEP_WATCHDOG_S", "600"))
+    )
 
 
 class EngineCore:
@@ -350,6 +360,68 @@ class EngineCore:
             outputs.append(self.scheduler.step())
         return outputs
 
+    async def _await_step_with_watchdog(
+        self, step_future: "asyncio.Future", watchdog_s: float
+    ) -> list:
+        """Await a step burst, surfacing an executor wedge instead of hanging.
+
+        The MLX executor is a single native thread; if a step wedges inside a
+        Metal call, Python cannot interrupt it and every queued request would
+        otherwise receive SSE keepalives forever with no log evidence (the
+        2026-07-09 abort-wedge signature: 69 minutes of total log silence).
+        On each watchdog expiry this logs the scheduler state at CRITICAL and
+        fails all current collectors so clients see a real error and can back
+        off, then keeps waiting — the thread cannot be killed, so a process
+        restart is the only true recovery, and the log now says so.
+
+        Uses asyncio.wait (not wait_for) so the timeout never cancels the
+        executor future; a burst that finishes late still delivers normally.
+        """
+        wedged_fires = 0
+        while True:
+            done, _ = await asyncio.wait({step_future}, timeout=watchdog_s)
+            if done:
+                if wedged_fires:
+                    logger.warning(
+                        "MLX executor recovered after %.0fs; step burst "
+                        "completed normally",
+                        wedged_fires * watchdog_s,
+                    )
+                return step_future.result()
+
+            wedged_fires += 1
+            scheduler = self.scheduler
+            logger.critical(
+                "MLX executor wedged: step burst has not returned in %.0fs "
+                "(fire #%d). Engine %s cannot make progress; restart the "
+                "server to recover. Scheduler state: running=%s waiting=%d "
+                "prefilling=%d pending_aborts=%s request_id_to_uid=%s",
+                wedged_fires * watchdog_s,
+                wedged_fires,
+                self._engine_id[:8],
+                list(scheduler.running.keys()),
+                len(scheduler.waiting),
+                len(scheduler.prefilling),
+                list(scheduler._pending_abort_ids),
+                dict(scheduler.request_id_to_uid),
+            )
+            # Fail every live collector so clients get an error instead of
+            # keepalives. The scheduler is not touched (its thread is stuck);
+            # collector.put runs on the event loop and is safe.
+            for rid, collector in list(self._output_collectors.items()):
+                collector.put(
+                    RequestOutput(
+                        request_id=rid,
+                        finished=True,
+                        finish_reason="error",
+                        error=(
+                            "oMLX engine executor is wedged in a native call; "
+                            "the server needs a restart"
+                        ),
+                    )
+                )
+                self._mark_request_finished(rid)
+
     async def _engine_loop(self) -> None:
         """Main engine loop - runs scheduler steps on the MLX executor.
 
@@ -373,9 +445,16 @@ class EngineCore:
                     self._reap_orphaned_collectors(now)
 
                 if self.scheduler.has_requests():
-                    step_outputs = await loop.run_in_executor(
+                    step_future = loop.run_in_executor(
                         self._mlx_executor, self._step_burst
                     )
+                    watchdog_s = self.config.step_watchdog_s
+                    if watchdog_s > 0:
+                        step_outputs = await self._await_step_with_watchdog(
+                            step_future, watchdog_s
+                        )
+                    else:
+                        step_outputs = await step_future
                     self._steps_executed += len(step_outputs)
 
                     # Distribute every step's outputs to collectors (one or

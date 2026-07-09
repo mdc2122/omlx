@@ -1008,6 +1008,104 @@ class TestDynamicCeilingCustom:
         # → clamped to metal 48 GB
         assert ceiling == 48 * 1024**3
 
+    def test_custom_clamped_to_physical_reclaim_max(self, mock_engine_pool):
+        """A custom ceiling above footprint + free + inactive + active is
+        clamped: memory held by other processes cannot be wired, and
+        proceeding wedged the machine into a watchdog kernel panic
+        (2026-07-09: custom=490GB with ~120GB physically reclaimable)."""
+        enforcer = ProcessMemoryEnforcer(
+            engine_pool=mock_engine_pool,
+            memory_guard_tier="custom",
+            memory_guard_custom_ceiling_gb=490.0,
+        )
+        with (
+            patch(
+                "omlx.process_memory_enforcer.get_macos_vm_stats",
+                return_value={
+                    "free": 40 * 1024**3,
+                    "inactive": 50 * 1024**3,
+                    "active": 20 * 1024**3,
+                    "wired": 0,
+                },
+            ),
+            patch(
+                "omlx.process_memory_enforcer.get_phys_footprint",
+                return_value=10 * 1024**3,
+            ),
+        ):
+            # physical max = 10 + 40 + 50 + 20 = 120 GB
+            assert enforcer._get_dynamic_ceiling() == 120 * 1024**3
+
+    def test_custom_below_physical_max_passes_verbatim(self, mock_engine_pool):
+        enforcer = ProcessMemoryEnforcer(
+            engine_pool=mock_engine_pool,
+            memory_guard_tier="custom",
+            memory_guard_custom_ceiling_gb=100.0,
+        )
+        with (
+            patch(
+                "omlx.process_memory_enforcer.get_macos_vm_stats",
+                return_value={
+                    "free": 200 * 1024**3,
+                    "inactive": 100 * 1024**3,
+                    "active": 50 * 1024**3,
+                    "wired": 0,
+                },
+            ),
+            patch(
+                "omlx.process_memory_enforcer.get_phys_footprint",
+                return_value=10 * 1024**3,
+            ),
+        ):
+            assert enforcer._get_dynamic_ceiling() == 100 * 1024**3
+
+    def test_custom_passes_verbatim_when_vm_stats_unavailable(
+        self, mock_engine_pool
+    ):
+        """No VM telemetry → no clamp; static / metal_cap stay the backstop."""
+        enforcer = ProcessMemoryEnforcer(
+            engine_pool=mock_engine_pool,
+            memory_guard_tier="custom",
+            memory_guard_custom_ceiling_gb=490.0,
+        )
+        with patch(
+            "omlx.process_memory_enforcer.get_macos_vm_stats",
+            return_value=None,
+        ):
+            assert enforcer._get_dynamic_ceiling() == 490 * 1024**3
+
+    def test_custom_clamp_applies_to_ceiling_breakdown(self, mock_engine_pool):
+        """The breakdown path (used by _propagate_memory_limit) sees the
+        clamped value too, so schedulers never plan against the raw input."""
+        enforcer = ProcessMemoryEnforcer(
+            engine_pool=mock_engine_pool,
+            memory_guard_tier="custom",
+            memory_guard_custom_ceiling_gb=490.0,
+        )
+        with (
+            patch("omlx.settings.get_system_memory", return_value=512 * 1024**3),
+            patch(
+                "omlx.process_memory_enforcer.get_effective_metal_cap_bytes",
+                return_value=448 * 1024**3,
+            ),
+            patch(
+                "omlx.process_memory_enforcer.get_macos_vm_stats",
+                return_value={
+                    "free": 40 * 1024**3,
+                    "inactive": 50 * 1024**3,
+                    "active": 20 * 1024**3,
+                    "wired": 0,
+                },
+            ),
+            patch(
+                "omlx.process_memory_enforcer.get_phys_footprint",
+                return_value=10 * 1024**3,
+            ),
+        ):
+            breakdown = enforcer._get_ceiling_breakdown()
+        assert breakdown["dynamic"] == 120 * 1024**3
+        assert breakdown["hard_limit"] == 120 * 1024**3
+
 
 class TestHardLimitCalculation:
     """`_get_hard_limit_bytes` returns min(static, dynamic), or 0 when guard off."""

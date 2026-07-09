@@ -108,6 +108,10 @@ _EMERGENCY_OVER_CEILING_MARGIN_BYTES = 2 * 1024**3
 _EMERGENCY_OVER_CEILING_POLLS = 2
 _HOT_CACHE_RESERVATION_SLACK_BYTES = 512 * 1024**2
 
+# The clamp check in `_clamped_custom_ceiling` runs on every 1 s poll; only
+# warn about an over-physical custom ceiling this often.
+_CUSTOM_CLAMP_WARN_INTERVAL_S = 60.0
+
 
 def _format_gb(b: int) -> str:
     """Format bytes as GB string."""
@@ -284,8 +288,10 @@ class ProcessMemoryEnforcer:
                 memory_guard_custom_ceiling_gb directly for the dynamic
                 ceiling instead of computing from vm_stat.
             memory_guard_custom_ceiling_gb: Custom ceiling in GB. Only
-                used when tier == "custom". Clamped by static_ceiling and
-                metal_cap so a too-large value is panic-safe.
+                used when tier == "custom". Clamped by static_ceiling,
+                metal_cap, and the physical reclaim maximum (footprint +
+                free + inactive + active) so a too-large value is
+                panic-safe even when other processes hold most of RAM.
             poll_interval: Seconds between memory checks.
             settings_manager: Optional settings manager for TTL checks.
             prefill_memory_guard: When False, returns a ceiling of 0 so
@@ -342,6 +348,9 @@ class ProcessMemoryEnforcer:
         # Prevents the per-poll warning from spamming logs while keeping
         # the first occurrence loud enough to alert CI / oncall.
         self._scheduler_resolve_warned: set[str] = set()
+        # Last time the custom-ceiling physical clamp warned (poll-path
+        # throttle; see _CUSTOM_CLAMP_WARN_INTERVAL_S).
+        self._custom_clamp_warned_at: float = 0.0
 
     @staticmethod
     def _normalize_tier(tier: str) -> str:
@@ -504,9 +513,19 @@ class ProcessMemoryEnforcer:
         """Tier-aware reclaimable-memory ceiling.
 
         custom:
-            Returns the user-supplied ceiling verbatim (clamped >= 0).
-            min() with static / metal_cap still applies in
-            `_get_hard_limit_bytes` so out-of-range input is panic safe.
+            Returns the user-supplied ceiling, clamped to the physical
+            maximum the OS could ever hand back (omlx footprint + free +
+            inactive + 100% of active). min() with static / metal_cap
+            still applies in `_get_hard_limit_bytes`. A custom ceiling
+            above the physical maximum cannot be honored by any setting:
+            wiring toward it starves the kernel of pageable memory and
+            trips the watchdog panic (observed 2026-07-09: custom=490GB
+            admitted a 321GB load while other processes held most of the
+            machine; watchdogd starved within 3 minutes). The clamp uses
+            a 1.0 active-reclaim ratio — strictly looser than the
+            aggressive tier's 0.8 — so custom still lets the user push
+            past every heuristic tier; it only refuses the physically
+            impossible.
 
         safe / balanced / aggressive:
             omlx_phys + free + inactive + active * ratio
@@ -526,7 +545,7 @@ class ProcessMemoryEnforcer:
         server health endpoints and the enforcer keep running.
         """
         if self._memory_guard_tier == "custom":
-            return max(0, self._memory_guard_custom_ceiling_bytes)
+            return self._clamped_custom_ceiling()
 
         omlx_usage = get_phys_footprint()
         stats = get_macos_vm_stats()
@@ -544,6 +563,36 @@ class ProcessMemoryEnforcer:
         ratio = _ACTIVE_RECLAIM_RATIO[self._memory_guard_tier]
         reclaimable = stats["free"] + stats["inactive"] + int(stats["active"] * ratio)
         return max(0, omlx_usage + reclaimable)
+
+    def _clamped_custom_ceiling(self) -> int:
+        """Custom ceiling clamped to the physical reclaim maximum.
+
+        Physical maximum = omlx footprint + free + inactive + active
+        (reclaim ratio 1.0). When VM telemetry is unavailable the custom
+        value passes through unclamped — static / metal_cap in
+        `_get_ceiling_breakdown` remain the backstop, same as before.
+        """
+        requested = max(0, self._memory_guard_custom_ceiling_bytes)
+        stats = get_macos_vm_stats()
+        if stats is None:
+            return requested
+        physical_max = get_phys_footprint() + (
+            stats["free"] + stats["inactive"] + stats["active"]
+        )
+        if requested > physical_max:
+            now = time.monotonic()
+            if now - self._custom_clamp_warned_at >= _CUSTOM_CLAMP_WARN_INTERVAL_S:
+                self._custom_clamp_warned_at = now
+                logger.warning(
+                    "Custom memory ceiling %s exceeds what the system can "
+                    "physically reclaim right now (%s); clamping. Free memory "
+                    "held by other processes cannot be wired without "
+                    "panicking the machine.",
+                    _format_gb(requested),
+                    _format_gb(physical_max),
+                )
+            return physical_max
+        return requested
 
     def _get_hard_limit_bytes(self) -> int:
         """Final hard ceiling = min(static, dynamic, metal_cap).
@@ -584,7 +633,7 @@ class ProcessMemoryEnforcer:
             return {"static": 0, "dynamic": 0, "metal_cap": 0, "hard_limit": 0}
         static_ceiling = self._get_static_ceiling()
         if self._memory_guard_tier == "custom":
-            dynamic_ceiling = max(0, self._memory_guard_custom_ceiling_bytes)
+            dynamic_ceiling = self._clamped_custom_ceiling()
         else:
             dynamic_ceiling = self._get_dynamic_ceiling()
         metal_cap = self._get_effective_metal_cap_bytes()

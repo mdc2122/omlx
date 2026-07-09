@@ -6849,7 +6849,17 @@ class Scheduler:
             # that replaces references to arrays still used by in-flight
             # Metal command buffers.  Without this barrier the Metal driver
             # can hit 'completeMemory() prepare count underflow'.
+            # Phase markers at INFO: both calls below run native Metal work
+            # that has been observed to wedge the executor thread
+            # (abort-wedge, 2026-07-09). If the server goes silent after one
+            # of these lines, the log identifies which native call is stuck.
+            logger.info(
+                "Abort %s: syncing stream before batch removal (uid=%d)",
+                request_id,
+                uid,
+            )
             _safe_sync_stream(self._stream)
+            logger.info("Abort %s: removing uid %d from active batch", request_id, uid)
             self._remove_uid_from_active_batch(uid)
             if hasattr(self.model, "unregister_rope_delta"):
                 self.model.unregister_rope_delta(uid)
@@ -6862,6 +6872,7 @@ class Scheduler:
             _unregister_uid_row(self.model, uid)
             del self.uid_to_request_id[uid]
             del self.request_id_to_uid[request.request_id]
+            logger.info("Abort %s: batch removal complete (uid=%d)", request_id, uid)
 
         if request_id in self.running:
             del self.running[request_id]
@@ -6928,11 +6939,18 @@ class Scheduler:
         so that the engine loop keeps calling step() until the clear fires.
         Without this, an idle server would never reach the target step and
         stale buffers would accumulate indefinitely.
+
+        Deferred aborts count as work for the same reason: an abort enqueued
+        against a request that has already left waiting/running (e.g. during
+        external prefill hand-off) must still get its step() to run
+        _process_pending_aborts(), or its cleanup is stranded until the next
+        unrelated request arrives.
         """
         return bool(
             self.waiting
             or self.prefilling
             or self.running
+            or self._pending_abort_ids
             or self._pending_async_removes
             or self._deferred_clear_at is not None
         )

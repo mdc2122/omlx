@@ -1767,3 +1767,72 @@ class TestOrphanedCollectorReaping:
             finally:
                 await engine.stop()
                 engine.close()
+
+
+class TestStepWatchdog:
+    """Tests for the executor-wedge watchdog in _engine_loop."""
+
+    def test_watchdog_default_configurable_via_env(self):
+        config = EngineConfig()
+        assert config.step_watchdog_s == 600.0
+
+    @pytest.mark.asyncio
+    async def test_wedged_step_fails_collectors_and_still_delivers(self):
+        """A step burst exceeding the watchdog errors out live collectors
+        (clients see a real error, not keepalives forever) but the executor
+        future is never cancelled — a late finish still delivers."""
+        engine = EngineCore.__new__(EngineCore)
+        engine._engine_id = "watchdog-test"
+        collector = RequestOutputCollector()
+        engine._output_collectors = {"req-stuck": collector}
+        engine._finished_events = {}
+        engine._stream_states = {}
+        engine._finished_at = {}
+
+        scheduler = MagicMock()
+        scheduler.running = {"req-stuck": object()}
+        scheduler.waiting = []
+        scheduler.prefilling = []
+        scheduler._pending_abort_ids = set()
+        scheduler.request_id_to_uid = {"req-stuck": 7}
+        engine.scheduler = scheduler
+
+        loop = asyncio.get_running_loop()
+        step_future = loop.create_future()
+
+        async def finish_late():
+            # Let the watchdog fire at least once before delivering.
+            await asyncio.sleep(0.12)
+            step_future.set_result(["burst-output"])
+
+        finisher = asyncio.create_task(finish_late())
+        result = await engine._await_step_with_watchdog(step_future, 0.05)
+        await finisher
+
+        assert result == ["burst-output"]
+        # Collector was failed while wedged.
+        output = collector.get_nowait()
+        assert output is not None
+        assert output.finished is True
+        assert output.finish_reason == "error"
+        assert "wedged" in output.error
+
+    @pytest.mark.asyncio
+    async def test_fast_step_never_touches_collectors(self):
+        engine = EngineCore.__new__(EngineCore)
+        engine._engine_id = "watchdog-test"
+        collector = RequestOutputCollector()
+        engine._output_collectors = {"req-ok": collector}
+        engine._finished_events = {}
+        engine._stream_states = {}
+        engine._finished_at = {}
+        engine.scheduler = MagicMock()
+
+        loop = asyncio.get_running_loop()
+        step_future = loop.create_future()
+        step_future.set_result(["fast"])
+
+        result = await engine._await_step_with_watchdog(step_future, 5.0)
+
+        assert result == ["fast"]
+        assert collector.get_nowait() is None
