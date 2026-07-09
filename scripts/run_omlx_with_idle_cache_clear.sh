@@ -14,9 +14,10 @@ set -u
 
 OMLX_DIR="/Users/studio2/omlx"
 OMLX_BIN="${OMLX_DIR}/.venv/bin/omlx"
-MODEL_DIR="/Users/studio2/.mlx-models"
-CACHE_DIR="${HOME}/.omlx/cache"
-HOST="127.0.0.1"
+MODEL_DIR="/Volumes/GLM5-NVMe/omlx/models"
+SSD_CACHE_DIR="${OMLX_PAGED_SSD_CACHE_DIR:-/Volumes/GLM5-NVMe/omlx/kv-cache-studio2}"
+CACHE_DIR="${SSD_CACHE_DIR}"
+HOST="0.0.0.0"
 PORT="8000"
 HOT_CACHE_MAX_SIZE="${OMLX_HOT_CACHE_MAX_SIZE:-140GB}"
 BASE_URL="http://${HOST}:${PORT}"
@@ -62,14 +63,16 @@ cd "${OMLX_DIR}" || exit 1
 
 purge_cache_if_requested
 
-echo "$(date '+%Y-%m-%d %H:%M:%S') [wrapper] starting oMLX serve on ${BASE_URL} (idle-clear=${IDLE_SECONDS}s hot-cache=${HOT_CACHE_MAX_SIZE})" >> "${LOG}"
+echo "$(date '+%Y-%m-%d %H:%M:%S') [wrapper] starting oMLX serve on ${BASE_URL} (idle-clear=${IDLE_SECONDS}s hot-cache=${HOT_CACHE_MAX_SIZE} ssd-kv=${SSD_CACHE_DIR})" >> "${LOG}"
 
 # Start the oMLX server.
 "${OMLX_BIN}" serve \
     --model-dir "${MODEL_DIR}" \
     --host "${HOST}" \
     --port "${PORT}" \
+    --max-concurrent-requests "${OMLX_MAX_CONCURRENT_REQUESTS:-4}" \
     --hot-cache-max-size "${HOT_CACHE_MAX_SIZE}" \
+    --paged-ssd-cache-dir "${SSD_CACHE_DIR}" \
     >> "${LOG}" 2>&1 &
 SERVER_PID=$!
 
