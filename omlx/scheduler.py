@@ -182,10 +182,9 @@ def _sync_and_clear_cache(stream=None):
     """
     with _mx_buffer_access_lock:
         # The engine stream may not have in-flight work on the current thread
-        # (for example, during teardown before that thread submits work). On
-        # some MLX builds mx.synchronize raises "There is no Stream(gpu, 0) in
-        # current thread" in that case; swallow it since there is nothing to
-        # drain.
+        # (e.g. external prefill submits to the default stream). On some MLX
+        # builds mx.synchronize raises "There is no Stream(gpu, 0) in current
+        # thread" in that case; swallow it since there is nothing to drain.
         target = stream if stream is not None else _default_generation_stream
         try:
             mx.synchronize(target)
@@ -3079,18 +3078,8 @@ class Scheduler:
                     )
 
             _throttle_pre = get_phys_footprint()
-            # External prefill bypasses BatchGenerator, so it must establish
-            # the per-engine stream context itself. Native lazy primitives
-            # otherwise bind to the worker's unrelated default stream and can
-            # fail at mx.eval with "There is no Stream(gpu, X) in current
-            # thread" (issue #2170).
-            with mx.stream(self._stream):
-                self.model(
-                    input_arr[:, :n_to_process],
-                    cache=prompt_cache,
-                    **model_kwargs,
-                )
-                mx.eval([c.state for c in prompt_cache])
+            self.model(input_arr[:, :n_to_process], cache=prompt_cache, **model_kwargs)
+            mx.eval([c.state for c in prompt_cache])
             _throttle_post = get_phys_footprint()
             self._record_chunk_transient(
                 n_to_process,
@@ -4058,11 +4047,8 @@ class Scheduler:
         chunk = state.tokens_remaining[:, :n]
         state.tokens_remaining = state.tokens_remaining[:, n:]
         _throttle_pre = get_phys_footprint()
-        # Chunked prefill also bypasses BatchGenerator and must establish the
-        # same per-engine stream context as the regular external prefill path.
-        with mx.stream(self._stream):
-            self.model(chunk, cache=state.cache)
-            mx.eval([c.state for c in state.cache])
+        self.model(chunk, cache=state.cache)
+        mx.eval([c.state for c in state.cache])
         _throttle_post = get_phys_footprint()
         self._record_chunk_transient(
             n,
@@ -6919,16 +6905,13 @@ class Scheduler:
             )
 
             t0 = time.monotonic()
-            # Draft scoring bypasses BatchGenerator, so keep its lazy model
-            # work and evals on this engine's worker-local stream.
-            with mx.stream(self._stream):
-                importance, used_cache = score_tokens(
-                    self._specprefill_draft_model,
-                    tokens_to_score,
-                    prefill_step_size=self.config.prefill_step_size,
-                    existing_cache=draft_cache,
-                    progress_callback=_score_progress,
-                )
+            importance, used_cache = score_tokens(
+                self._specprefill_draft_model,
+                tokens_to_score,
+                prefill_step_size=self.config.prefill_step_size,
+                existing_cache=draft_cache,
+                progress_callback=_score_progress,
+            )
             selected = select_chunks(importance, keep_pct=keep_pct)
             t_score = time.monotonic() - t0
 
@@ -8280,9 +8263,8 @@ class Scheduler:
                                 detail="system prompt prefill",
                                 extra=spec_sparse_extra,
                             )
-                            with mx.stream(self._stream):
-                                self.model(sys_arr[:step][None], cache=sp_cache)
-                                mx.eval([c.state for c in sp_cache])
+                            self.model(sys_arr[:step][None], cache=sp_cache)
+                            mx.eval([c.state for c in sp_cache])
                             sys_processed += step
                             _check_specprefill_abort(sys_processed)
                             tracker.update(
@@ -8315,9 +8297,8 @@ class Scheduler:
                                 detail="system prompt prefill",
                                 extra=spec_sparse_extra,
                             )
-                            with mx.stream(self._stream):
-                                self.model(sys_arr[None], cache=sp_cache)
-                                mx.eval([c.state for c in sp_cache])
+                            self.model(sys_arr[None], cache=sp_cache)
+                            mx.eval([c.state for c in sp_cache])
                             sys_processed += final_sys
                             _check_specprefill_abort(sys_processed)
                             tracker.update(
@@ -8372,17 +8353,15 @@ class Scheduler:
                             },
                         )
 
-                    # Sparse target prefill also runs its own model/eval loop.
-                    with mx.stream(self._stream):
-                        sparse_prefill(
-                            self.model,
-                            conv_tokens,
-                            selected,
-                            sp_cache,
-                            step_size=self.config.prefill_step_size,
-                            position_offset=pos_offset,
-                            progress_callback=_sparse_progress,
-                        )
+                    sparse_prefill(
+                        self.model,
+                        conv_tokens,
+                        selected,
+                        sp_cache,
+                        step_size=self.config.prefill_step_size,
+                        position_offset=pos_offset,
+                        progress_callback=_sparse_progress,
+                    )
                     # sparse_prefill installs _OffsetAdjustedRoPE with
                     # adjustment = conv_len - selected_len'. Subtract 1 to account for the
                     # extra token BatchGenerator will process.
