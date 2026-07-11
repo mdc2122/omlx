@@ -9,6 +9,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 from PIL import Image
 
+from omlx.exceptions import InvalidRequestError
 from omlx.utils.image import (
     TempVideoPath,
     compute_image_hash,
@@ -19,12 +20,14 @@ from omlx.utils.image import (
     load_video_reference,
 )
 
-
 # =============================================================================
 # Helper: create small test images
 # =============================================================================
 
-def _make_test_image(width: int = 4, height: int = 4, color: str = "red") -> Image.Image:
+
+def _make_test_image(
+    width: int = 4, height: int = 4, color: str = "red"
+) -> Image.Image:
     """Create a small solid-color test image."""
     return Image.new("RGB", (width, height), color)
 
@@ -39,6 +42,7 @@ def _image_to_base64(img: Image.Image, fmt: str = "PNG") -> str:
 # =============================================================================
 # Tests: load_image
 # =============================================================================
+
 
 class TestLoadImage:
     """Tests for load_image()."""
@@ -72,43 +76,52 @@ class TestLoadImage:
         assert isinstance(loaded, Image.Image)
         assert loaded.size == (8, 8)
 
-    def test_load_base64_without_media_type(self):
-        """Load image from data URI without explicit media type."""
+    def test_rejects_data_uri_without_image_media_type(self):
+        """Image data URIs must include an image media type."""
         img = _make_test_image(4, 4)
         b64 = _image_to_base64(img)
-        # Minimal data URI format
         uri = f"data:;base64,{b64}"
 
-        loaded = load_image(uri)
-        assert isinstance(loaded, Image.Image)
+        with pytest.raises(InvalidRequestError):
+            load_image(uri)
 
     @patch("urllib.request.urlopen")
-    def test_load_from_url(self, mock_urlopen):
-        """Load image from HTTP URL."""
-        img = _make_test_image(4, 4)
-        buf = io.BytesIO()
-        img.save(buf, format="PNG")
-        buf.seek(0)
-        mock_urlopen.return_value.__enter__ = MagicMock(return_value=buf)
-        mock_urlopen.return_value.__exit__ = MagicMock(return_value=False)
+    def test_rejects_remote_url_without_fetching(self, mock_urlopen):
+        """Remote URL image refs are rejected without server-side fetches."""
+        with pytest.raises(InvalidRequestError):
+            load_image("https://example.com/image.png")
+        mock_urlopen.assert_not_called()
 
-        loaded = load_image("https://example.com/image.png")
-        assert isinstance(loaded, Image.Image)
+    def test_rejects_local_file_path(self, tmp_path):
+        """Local filesystem image refs are rejected before opening files."""
+        img = _make_test_image(4, 4)
+        path = tmp_path / "local.png"
+        img.save(path)
+
+        with pytest.raises(InvalidRequestError):
+            load_image(str(path))
 
     def test_load_invalid_format_raises(self):
-        """Invalid input raises ValueError."""
-        with pytest.raises((ValueError, IOError)):
+        """Invalid input raises a request error."""
+        with pytest.raises(InvalidRequestError):
             load_image("not-a-valid-image-source")
 
     def test_load_invalid_base64_raises(self):
         """Invalid base64 data raises error."""
-        with pytest.raises((ValueError, IOError)):
+        with pytest.raises(InvalidRequestError):
             load_image("data:image/png;base64,not_valid_base64!!!")
+
+    def test_rejects_non_image_data_uri(self):
+        """Non-image data URIs are rejected for image inputs."""
+        data = base64.b64encode(b"hello").decode()
+        with pytest.raises(InvalidRequestError):
+            load_image(f"data:text/plain;base64,{data}")
 
 
 # =============================================================================
 # Tests: extract_images_from_messages
 # =============================================================================
+
 
 class TestExtractImagesFromMessages:
     """Tests for extract_images_from_messages()."""
@@ -177,8 +190,14 @@ class TestExtractImagesFromMessages:
             {
                 "role": "user",
                 "content": [
-                    {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64_1}"}},
-                    {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64_2}"}},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/png;base64,{b64_1}"},
+                    },
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/png;base64,{b64_2}"},
+                    },
                     {"type": "text", "text": "Compare these"},
                 ],
             },
@@ -196,7 +215,10 @@ class TestExtractImagesFromMessages:
             {
                 "role": "user",
                 "content": [
-                    {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/png;base64,{b64}"},
+                    },
                     {"type": "text", "text": "Describe this"},
                 ],
             },
@@ -220,8 +242,8 @@ class TestExtractImagesFromMessages:
         text_msgs, images, audio = extract_images_from_messages(messages)
         assert "tool_calls" in text_msgs[0]
 
-    def test_invalid_image_url_skipped(self):
-        """Invalid image URLs are skipped with warning."""
+    def test_invalid_image_url_rejected(self):
+        """Invalid image URLs are rejected instead of silently skipped."""
         messages = [
             {
                 "role": "user",
@@ -231,8 +253,8 @@ class TestExtractImagesFromMessages:
                 ],
             },
         ]
-        text_msgs, images, audio = extract_images_from_messages(messages)
-        assert len(images) == 0
+        with pytest.raises(InvalidRequestError):
+            extract_images_from_messages(messages)
 
     def test_pydantic_model_content_parts(self):
         """Content parts as Pydantic-like objects with type/text/image_url attrs."""
@@ -263,10 +285,13 @@ class TestExtractImagesFromMessages:
             {
                 "role": "user",
                 "content": [
-                    {"type": "input_audio", "input_audio": {
-                        "data": "data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEARKwAABCxAgAEABAAZGF0YQAAAAA=",
-                        "format": "wav",
-                    }},
+                    {
+                        "type": "input_audio",
+                        "input_audio": {
+                            "data": "data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEARKwAABCxAgAEABAAZGF0YQAAAAA=",
+                            "format": "wav",
+                        },
+                    },
                     {"type": "text", "text": "What do you hear?"},
                 ],
             },
@@ -280,6 +305,7 @@ class TestExtractImagesFromMessages:
     def test_input_audio_raw_base64(self):
         """Messages with raw base64 input_audio extract audio."""
         import base64
+
         raw_bytes = b"\x00\x01\x02\x03" * 16
         b64 = base64.b64encode(raw_bytes).decode()
 
@@ -287,10 +313,13 @@ class TestExtractImagesFromMessages:
             {
                 "role": "user",
                 "content": [
-                    {"type": "input_audio", "input_audio": {
-                        "data": b64,
-                        "format": "wav",
-                    }},
+                    {
+                        "type": "input_audio",
+                        "input_audio": {
+                            "data": b64,
+                            "format": "wav",
+                        },
+                    },
                 ],
             },
         ]
@@ -306,10 +335,13 @@ class TestExtractImagesFromMessages:
             {
                 "role": "user",
                 "content": [
-                    {"type": "input_audio", "input_audio": {
-                        "data": raw_bytes,
-                        "format": "wav",
-                    }},
+                    {
+                        "type": "input_audio",
+                        "input_audio": {
+                            "data": raw_bytes,
+                            "format": "wav",
+                        },
+                    },
                 ],
             },
         ]
@@ -317,47 +349,51 @@ class TestExtractImagesFromMessages:
         assert len(audio) == 1
         assert hasattr(audio[0], "read")
 
-    def test_input_audio_string_path(self):
-        """Non-base64 string input_audio.data is treated as a file path/reference."""
+    def test_input_audio_string_path_rejected(self):
+        """Non-base64 input_audio.data strings are rejected as path refs."""
         messages = [
             {
                 "role": "user",
                 "content": [
-                    {"type": "input_audio", "input_audio": {
-                        "data": "/tmp/audio.wav",
-                        "format": "wav",
-                    }},
+                    {
+                        "type": "input_audio",
+                        "input_audio": {
+                            "data": "/tmp/audio.wav",
+                            "format": "wav",
+                        },
+                    },
                 ],
             },
         ]
-        text_msgs, images, audio = extract_images_from_messages(messages)
-        assert len(audio) == 1
-        # Should be the string path, not a BytesIO (not valid base64)
-        assert isinstance(audio[0], str)
-        assert audio[0] == "/tmp/audio.wav"
+        with pytest.raises(InvalidRequestError):
+            extract_images_from_messages(messages)
 
-    def test_invalid_input_audio_skipped(self):
-        """Invalid base64 in input_audio is skipped with warning."""
+    def test_invalid_input_audio_rejected(self):
+        """Invalid input_audio base64 is rejected."""
         messages = [
             {
                 "role": "user",
                 "content": [
-                    {"type": "input_audio", "input_audio": {
-                        "data": "data:audio/wav;base64,!!!not_valid_base64!!!",
-                        "format": "wav",
-                    }},
+                    {
+                        "type": "input_audio",
+                        "input_audio": {
+                            "data": "data:audio/wav;base64,!!!not_valid_base64!!!",
+                            "format": "wav",
+                        },
+                    },
                     {"type": "text", "text": "test"},
                 ],
             },
         ]
-        text_msgs, images, audio = extract_images_from_messages(messages)
-        assert len(audio) == 0
+        with pytest.raises(InvalidRequestError):
+            extract_images_from_messages(messages)
 
     def test_audio_mixed_with_images(self):
         """Audio and images in the same message both extracted."""
         img = _make_test_image(4, 4)
         b64 = _image_to_base64(img)
         import base64 as b64_mod
+
         raw_bytes = b"\x00\x01\x02\x03" * 16
         audio_b64 = b64_mod.b64encode(raw_bytes).decode()
 
@@ -365,11 +401,17 @@ class TestExtractImagesFromMessages:
             {
                 "role": "user",
                 "content": [
-                    {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}},
-                    {"type": "input_audio", "input_audio": {
-                        "data": audio_b64,
-                        "format": "wav",
-                    }},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/png;base64,{b64}"},
+                    },
+                    {
+                        "type": "input_audio",
+                        "input_audio": {
+                            "data": audio_b64,
+                            "format": "wav",
+                        },
+                    },
                     {"type": "text", "text": "Describe this image and audio"},
                 ],
             },
@@ -500,6 +542,7 @@ class TestExtractMediaFromMessagesVideo:
 # =============================================================================
 # Tests: compute_image_hash
 # =============================================================================
+
 
 class TestComputeImageHash:
     """Tests for compute_image_hash()."""
