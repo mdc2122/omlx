@@ -12,10 +12,17 @@
 
 set -u
 
-OMLX_DIR="/Users/studio2/omlx"
+# Host-agnostic: both Studios run this same committed file (the twins
+# previously drifted on a 2-line local path edit). Cache-dir defaults
+# preserve each machine's existing directory name.
+OMLX_DIR="${HOME}/omlx"
 OMLX_BIN="${OMLX_DIR}/.venv/bin/omlx"
 MODEL_DIR="/Volumes/GLM5-NVMe/omlx/models"
-SSD_CACHE_DIR="${OMLX_PAGED_SSD_CACHE_DIR:-/Volumes/GLM5-NVMe/omlx/kv-cache-studio2}"
+case "$(id -un)" in
+    studio1) _DEFAULT_KV_DIR="/Volumes/GLM5-NVMe/omlx/kv-cache" ;;
+    *)       _DEFAULT_KV_DIR="/Volumes/GLM5-NVMe/omlx/kv-cache-$(id -un)" ;;
+esac
+SSD_CACHE_DIR="${OMLX_PAGED_SSD_CACHE_DIR:-${_DEFAULT_KV_DIR}}"
 CACHE_DIR="${SSD_CACHE_DIR}"
 HOST="0.0.0.0"
 PORT="8000"
