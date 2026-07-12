@@ -6434,7 +6434,11 @@ class Scheduler:
                     model_name=name,
                 )
                 draft_ssd = PagedSSDCacheManager(
-                    cache_dir=Path(self.config.paged_ssd_cache_dir),
+                    # Same per-model isolation as the main manager: the
+                    # draft model has its own layer signature and would
+                    # otherwise re-sign / invalidate the target's blocks.
+                    cache_dir=Path(self.config.paged_ssd_cache_dir)
+                    / os.path.basename(name.rstrip("/")),
                     max_size_bytes=self.config.paged_ssd_cache_max_size,
                     hot_cache_max_bytes=self.config.hot_cache_max_size,
                     hot_cache_only=self.config.hot_cache_only,
@@ -10517,6 +10521,17 @@ class Scheduler:
                 if self.config.paged_ssd_cache_dir
                 else None
             )
+            # Per-model subdirectory (same isolation CacheFactory.
+            # create_paged_ssd_cache applies): models with different
+            # block sizes / layer signatures sharing one directory
+            # re-sign it on every swap and mass-invalidate each other's
+            # blocks (2026-07-11: Qwen@2048 left GLM reusing 1.8 GB of
+            # a 54 GB cache, 563 blocks skipped incompatible).
+            # model_name may be a filesystem path — use its basename.
+            if cache_dir is not None and self.config.model_name:
+                cache_dir = cache_dir / os.path.basename(
+                    self.config.model_name.rstrip("/")
+                )
 
             # Pass current model identity so stale blocks from a prior model
             # version (e.g., 30-layer cache after an upgrade to 40 layers via

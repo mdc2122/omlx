@@ -59,8 +59,40 @@ check_cache_health_from_log() {
     fi
 }
 
+guard_orphaned_wired() {
+    # Wedge→kill cycles strand wired IOGPU memory that only a reboot
+    # reclaims (2026-07-11: three orphaning events, 313→517 GB). With
+    # launchd KeepAlive=true, a crashing server would otherwise restart
+    # every ThrottleInterval and re-wedge, orphaning more each cycle.
+    # If wired memory is huge while no model server owns it, the machine
+    # needs a reboot: hold this KeepAlive slot instead of flailing.
+    local wired_gb i
+    # Grace loop: after a normal `kickstart -k` the previous (healthy)
+    # server's wired memory takes a few seconds to reclaim. Only treat
+    # persistently-high wired as orphaned.
+    for i in 1 2 3 4 5 6; do
+        wired_gb=$(/usr/bin/vm_stat | /usr/bin/awk '/Pages wired/ {printf "%d", $4*16384/1e9}')
+        [ "${wired_gb:-0}" -le 100 ] && return 0
+        sleep 10
+    done
+    if [ "${wired_gb:-0}" -gt 100 ]; then
+        echo "$(date '+%Y-%m-%d %H:%M:%S') [wrapper] BLOCKED: ${wired_gb} GB wired with no server running — orphaned IOGPU memory from a prior wedge. REBOOT studio2, then this job starts cleanly. Holding (statuspage :9130 alarms on this)." >> "${LOG}"
+        # Sleep-loop rather than exit: exiting makes launchd respawn us
+        # every 30 s and spam the log; holding keeps one quiet sentinel.
+        while true; do
+            sleep 300
+            wired_gb=$(/usr/bin/vm_stat | /usr/bin/awk '/Pages wired/ {printf "%d", $4*16384/1e9}')
+            if [ "${wired_gb:-0}" -le 100 ]; then
+                echo "$(date '+%Y-%m-%d %H:%M:%S') [wrapper] wired memory recovered (${wired_gb} GB) — proceeding with server start." >> "${LOG}"
+                break
+            fi
+        done
+    fi
+}
+
 cd "${OMLX_DIR}" || exit 1
 
+guard_orphaned_wired
 purge_cache_if_requested
 
 echo "$(date '+%Y-%m-%d %H:%M:%S') [wrapper] starting oMLX serve on ${BASE_URL} (idle-clear=${IDLE_SECONDS}s hot-cache=${HOT_CACHE_MAX_SIZE} ssd-kv=${SSD_CACHE_DIR})" >> "${LOG}"
